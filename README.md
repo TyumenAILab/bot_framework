@@ -28,7 +28,9 @@ src/botkit/
 ├── rubric/       B3  Rubric & Taxonomy Store  (SC08)      — реализован (sqlite_store.py)
 ├── authority/    B4  Human Authority Gate     (SC14+SC16) — реализован (gate.py, identity_env.py)
 ├── evidence/     B5  Evidence & Citation Layer (SC04+SC05) — реализован (llm_checker.py, sqlite_store.py)
-└── simulation/   C1  Simulation & Scenario Engine (SC02+SC03) — реализован (persona.py, scenario.py, routing.py)
+├── simulation/   C1  Simulation & Scenario Engine (SC02+SC03) — реализован (persona.py, scenario.py, routing.py)
+└── consent/      Согласие на обработку ПД в начале бота — реализован (base.py, sqlite_store.py);
+                  вне нумерации A/B/C
 
 policies/         данные SupportPolicy / CriterionPackage (YAML) — по одной на навык
 tests/            тесты по модулям, зеркалят структуру src/botkit/
@@ -113,6 +115,8 @@ from botkit.dialog_policy.base import SupportPolicy
   но не подключён ни к одному навыку.
 - [«Simulation — как пользоваться.md»](docs/Simulation%20—%20как%20пользоваться.md) —
   `botkit.simulation`: `PersonaSimulator`, `ScenarioGenerator`, интеграция с B1 через `route_or_continue`.
+- [«Consent — как пользоваться.md»](docs/Consent%20—%20как%20пользоваться.md) —
+  `botkit.consent`: экран согласия на обработку ПД при первом контакте, `ConsentGate`, журнал решений.
 
 При обновлении документа-первоисточника в родительской папке портфеля —
 копию в `docs/` нужно обновлять вручную (`cp`), автосинхронизации нет.
