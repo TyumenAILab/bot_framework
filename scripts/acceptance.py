@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MARKER = "BOTKIT-7319"
 KNOWN_LIMITS = [
     "This is smoke acceptance, not full domain or all-method API certification.",
-    "Native-handler interception and VK callback message IDs need regression checks.",
+    "SDK dispatch and VK callback IDs are checked offline; live delivery still needs acceptance.",
     "Messenger attachment normalization does not cover all platform media types.",
     "Cost must be reconciled with provider billing; unknown cost is not zero.",
 ]

@@ -8,6 +8,28 @@ from typing import Any, Protocol
 logger = logging.getLogger(__name__)
 
 
+def _validate_attachment_metadata(size: int | None, max_bytes: int) -> None:
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise ValueError("Attachment byte limit must be a positive integer")
+    if size is not None and (type(size) is not int or size < 0):
+        raise ValueError("Attachment size must be a nonnegative integer or None")
+    if size is not None and size > max_bytes:
+        raise ValueError("Attachment exceeds the configured size limit")
+
+
+def _attachment_bytes(value: Any, max_bytes: int) -> bytes:
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        raise TypeError("Attachment reader must return bytes")
+    try:
+        byte_count = memoryview(value).nbytes
+    except ValueError:
+        raise TypeError("Attachment reader must return readable bytes") from None
+    if byte_count > max_bytes:
+        raise ValueError("Attachment exceeds the configured size limit")
+    # Freeze mutable buffers only after checking their actual byte count.
+    return bytes(value)
+
+
 @dataclass
 class Attachment:
     kind: str
@@ -19,14 +41,10 @@ class Attachment:
     platform_id: str | None = None
 
     async def read_bytes(self) -> bytes:
-        if self.size is not None and self.size > self.max_bytes:
-            raise ValueError("Attachment exceeds the configured size limit")
+        _validate_attachment_metadata(self.size, self.max_bytes)
         if self.reader is None:
             raise NotImplementedError("Attachment reader is not configured")
-        data = await self.reader()
-        if len(data) > self.max_bytes:
-            raise ValueError("Attachment exceeds the configured size limit")
-        return data
+        return _attachment_bytes(await self.reader(), self.max_bytes)
 
 
 @dataclass
@@ -49,6 +67,8 @@ class CallbackQuery:
     user_id: str
     chat_id: str
     data: str
+    # Opaque adapter ID: VK callbacks use "cmid:N" for conversation-local IDs;
+    # ordinary numeric VK send/message IDs remain global. Pass through unchanged.
     message_id: str | None = None
     raw: Any = field(default=None, repr=False)
 

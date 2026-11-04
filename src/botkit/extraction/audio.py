@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+
 from botkit.llm.base import AudioTranscriptionProvider
 
 from .base import ExtractedContent
-from .config import ExtractionConfig
+from .config import ExtractionConfig, UnsupportedContentError
 
 
 class AudioExtractor:
@@ -28,12 +30,15 @@ class AudioExtractor:
 
     async def extract(self, data: bytes, mime_type: str) -> ExtractedContent:
         self.config.check_bytes(data)
-        response = await self.transcriber.atranscribe(
-            data,
-            mime_type=mime_type,
-            filename="audio." + self.extensions[mime_type],
-            timeout=self.config.audio_timeout,
-        )
+        if mime_type not in self.extensions:
+            raise UnsupportedContentError("Unsupported ASR audio type")
+        async with asyncio.timeout(self.config.audio_timeout):
+            response = await self.transcriber.atranscribe(
+                data,
+                mime_type=mime_type,
+                filename="audio." + self.extensions[mime_type],
+                timeout=self.config.audio_timeout,
+            )
         self.config.check_text(response.response)
         warnings = ["audio_transcript_unverified"]
         if response.meta.get("postprocessed"):

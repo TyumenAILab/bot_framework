@@ -138,7 +138,7 @@ class PneumaTranscriber:
                     chunks.append(chunk)
                 try:
                     body = json.loads(b"".join(chunks))
-                except (ValueError, UnicodeError):
+                except (ValueError, UnicodeError, RecursionError):
                     raise ProviderError(
                         "Pneuma returned invalid JSON; check API URL and authorization"
                     ) from None

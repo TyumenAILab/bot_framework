@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import ssl
 from dataclasses import dataclass, field
@@ -34,10 +35,16 @@ class LLMConfig:
             raise ValueError("async mode is supported only for 302ai")
         if self.provider == "302ai" and not self.api_key:
             raise ValueError("API_302AI_KEY is required for 302ai")
-        if self.timeout <= 0 or self.poll_interval <= 0 or self.max_retries < 0:
-            raise ValueError("Timeout and poll interval must be positive; retries must be nonnegative")
-        if self.request_interval < 0:
-            raise ValueError("request_interval must be nonnegative")
+        for name in ("timeout", "poll_interval", "request_interval"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+            if value < 0 or (name != "request_interval" and value == 0):
+                raise ValueError(f"Invalid {name}")
+        if type(self.max_retries) is not int or self.max_retries < 0:
+            raise ValueError("max_retries must be a nonnegative integer")
+        if any(c in self.api_key for c in "\r\n"):
+            raise ValueError("API key must not contain line breaks")
 
     @classmethod
     def from_env(cls, provider: str | None = None) -> LLMConfig:

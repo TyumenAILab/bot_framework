@@ -25,10 +25,12 @@ Use an empty string/list for absent text/tables. Include a warning if blank or u
 def vision_payload(response: LLMResponse) -> dict:
     if response.finish_reason == "length":
         raise InvalidLLMResponse("Vision result was truncated")
+    if not isinstance(response.raw, str):
+        raise InvalidLLMResponse("Vision response must be text")
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", response.raw.strip(), flags=re.IGNORECASE)
     try:
         value = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise InvalidLLMResponse("Vision response is not JSON") from None
     if not isinstance(value, dict) or not isinstance(value.get("text"), str):
         raise InvalidLLMResponse("Vision result must have a text field")
@@ -90,16 +92,19 @@ class ImageExtractor:
 
     async def extract(self, data: bytes, mime_type: str) -> ExtractedContent:
         png, warnings = await asyncio.to_thread(normalize_image, data, self.config)
-        response = await self.llm.ainvoke_with_image_b64(
-            OCR_PROMPT,
-            base64.b64encode(png).decode("ascii"),
-            mime_type="image/png",
-            temperature=0,
-            max_tokens=self.config.vision_max_tokens,
-            timeout=self.config.vision_timeout,
-            validator=vision_payload,
-        )
-        payload = vision_payload(response)
+        # Custom providers may ignore timeout/validator options. Keep a local
+        # deadline and validate again after their return, without swallowing cancellation.
+        async with asyncio.timeout(self.config.vision_timeout):
+            response = await self.llm.ainvoke_with_image_b64(
+                OCR_PROMPT,
+                base64.b64encode(png).decode("ascii"),
+                mime_type="image/png",
+                temperature=0,
+                max_tokens=self.config.vision_max_tokens,
+                timeout=self.config.vision_timeout,
+                validator=self._validated_payload,
+            )
+        payload = self._validated_payload(response)
         self.config.check_text(json.dumps(payload, ensure_ascii=False))
         warnings += ["vision_ocr_unverified", *payload["warnings"]]
         if not payload["text"].strip() and not payload["tables"]:
@@ -117,3 +122,11 @@ class ImageExtractor:
                 "fallback_used": response.meta.get("fallback_used", False),
             },
         )
+
+    def _validated_payload(self, response: LLMResponse) -> dict:
+        self.config.check_text(response.raw)
+        payload = vision_payload(response)
+        cells = sum(len(row) for table in payload["tables"] for row in table["rows"])
+        if cells > self.config.max_cells:
+            raise ExtractionLimitError("Vision table cell limit exceeded")
+        return payload

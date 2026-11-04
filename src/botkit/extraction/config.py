@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from typing import Literal
@@ -42,8 +43,19 @@ class ExtractionConfig:
         if self.pdf_mode not in {"auto", "text", "vision"}:
             raise ValueError("pdf_mode must be auto, text or vision")
         for name, value in vars(self).items():
-            if name != "pdf_mode" and (not isinstance(value, (int, float)) or value <= 0):
-                raise ValueError(f"{name} must be positive")
+            if name == "pdf_mode":
+                continue
+            if name in {"vision_timeout", "audio_timeout"}:
+                try:
+                    valid = type(value) in {int, float} and math.isfinite(value) and value > 0
+                except OverflowError:
+                    valid = False
+            else:
+                valid = type(value) is int and value > 0
+            if not valid:
+                raise ValueError(
+                    f"{name} must be a positive finite {'number' if name.endswith('timeout') else 'integer'}"
+                )
 
     @classmethod
     def from_env(cls) -> ExtractionConfig:
@@ -59,11 +71,15 @@ class ExtractionConfig:
         )
 
     def check_bytes(self, data: bytes) -> None:
+        if not isinstance(data, bytes):
+            raise ExtractionError("Attachment data must be bytes")
         if not data:
             raise ExtractionError("Empty attachment")
         if len(data) > self.max_bytes:
             raise ExtractionLimitError("Attachment exceeds extraction size limit")
 
     def check_text(self, text: str) -> None:
+        if not isinstance(text, str):
+            raise ExtractionError("Extracted content must be text")
         if len(text) > self.max_text_chars:
             raise ExtractionLimitError("Extracted text exceeds character limit")

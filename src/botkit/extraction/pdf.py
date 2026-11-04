@@ -157,6 +157,12 @@ class PDFExtractor:
         return mime_type == "application/pdf"
 
     async def extract(self, data: bytes, mime_type: str) -> ExtractedContent:
+        self.config.check_bytes(data)
+        if self.config.pdf_mode == "vision" and self.vision is None:
+            raise ExtractionError("PDF vision mode requires an LLM provider")
+        # pdfplumber.pages eagerly builds page objects. Bound the page count
+        # with the existing native renderer before the heavier text/table pass.
+        count = await asyncio.to_thread(_page_count, data, self.config)
         pages = None
         initial_warnings = []
         if self.config.pdf_mode != "vision":
@@ -169,7 +175,6 @@ class PDFExtractor:
                     raise
                 initial_warnings = ["native_parser_failed"]
         if pages is None:
-            count = await asyncio.to_thread(_page_count, data, self.config)
             pages = [
                 {
                     "page_number": n,
@@ -191,11 +196,15 @@ class PDFExtractor:
             raise ExtractionLimitError("PDF exceeds vision page budget; split the document or use text mode")
         if needs_vision and self.config.pdf_mode == "vision" and self.vision is None:
             raise ExtractionError("PDF vision mode requires an LLM provider")
+        rendered_bytes = 0
         for page in needs_vision:
             if self.vision is None:
                 page["warnings"].append("vision_unavailable")
                 continue
             image = await asyncio.to_thread(_render_page, data, page["page_number"], self.config)
+            rendered_bytes += len(image.data)
+            if rendered_bytes > self.config.max_rendered_bytes:
+                raise ExtractionLimitError("Rendered PDF exceeds total image size limit")
             ctx = current_context()
             with usage_context(meta={**ctx.get("meta", {}), "extraction_page": page["page_number"]}):
                 extracted = await self.vision.extract(image.data, image.mime_type)
@@ -207,9 +216,12 @@ class PDFExtractor:
             )
             page["warnings"].extend(extracted.warnings)
             self.config.check_text("\n".join(p["text"] for p in pages))
-        text = "\n\n".join(f"[Page {p['page_number']}]\n{p['text']}" for p in pages)
+        has_content = any(p["text"].strip() or p["tables"] for p in pages)
+        text = "\n\n".join(f"[Page {p['page_number']}]\n{p['text']}" for p in pages) if has_content else ""
         self.config.check_text(text)
         warnings = [f"page:{p['page_number']}:{w}" for p in pages for w in p["warnings"]]
+        if not has_content:
+            warnings.append("empty_extraction")
         has_vision = any(p["method"] == "vision" for p in pages)
         confidence = "low" if warnings or has_vision else "high"
         return ExtractedContent(

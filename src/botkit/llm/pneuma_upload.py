@@ -166,7 +166,7 @@ class ChunkedPneumaTranscriber:
                     return {}
                 try:
                     value = json.loads(body)
-                except (ValueError, UnicodeError):
+                except (ValueError, UnicodeError, RecursionError):
                     raise UploadError("Pneuma returned invalid JSON") from None
                 if not isinstance(value, dict):
                     raise UploadError("Pneuma returned an invalid response object")
@@ -194,15 +194,25 @@ class ChunkedPneumaTranscriber:
 
     @classmethod
     def _job(cls, value):
-        candidate = value.get("job_id") or value.get("transcription_job_id")
-        if not candidate and isinstance(value.get("job"), dict):
-            candidate = value["job"].get("job_id") or value["job"].get("id")
-        return cls._id(candidate) if candidate is not None else None
+        candidates = [
+            value[name] for name in ("job_id", "transcription_job_id") if value.get(name) is not None
+        ]
+        nested = value.get("job")
+        if nested is not None:
+            if not isinstance(nested, dict):
+                raise UploadError("Pneuma returned an invalid job object")
+            candidates.extend(nested[name] for name in ("job_id", "id") if nested.get(name) is not None)
+        identifiers = [cls._id(candidate) for candidate in candidates]
+        if len(set(identifiers)) > 1:
+            raise UploadError("Pneuma returned conflicting job identifiers")
+        return identifiers[0] if identifiers else None
 
     @staticmethod
     def _offset(value, total):
         candidate = value.get("received_bytes")
-        if isinstance(candidate, str) and candidate.isdecimal():
+        if isinstance(candidate, str) and candidate.isascii() and candidate.isdecimal():
+            if len(candidate) > 20:
+                raise UploadError("Pneuma returned an invalid received_bytes offset")
             candidate = int(candidate)
         if type(candidate) is not int or not 0 <= candidate <= total:
             raise UploadError("Pneuma returned an invalid received_bytes offset")
@@ -308,16 +318,18 @@ class ChunkedPneumaTranscriber:
             return job
 
     @staticmethod
-    def _transcript(value):
+    def _transcript(value, depth=0):
+        if depth > 64:
+            raise UploadError("Pneuma transcript nesting is invalid")
         if isinstance(value, str):
             return value.strip()
         # Structured segments are accepted only when they contain explicit text.
         if isinstance(value, dict):
             for key in ("text", "transcript", "segments"):
                 if key in value:
-                    return ChunkedPneumaTranscriber._transcript(value[key])
+                    return ChunkedPneumaTranscriber._transcript(value[key], depth + 1)
         if isinstance(value, list) and value:
-            return "\n".join(ChunkedPneumaTranscriber._transcript(part) for part in value)
+            return "\n".join(ChunkedPneumaTranscriber._transcript(part, depth + 1) for part in value)
         raise UploadError("Pneuma has no textual transcript")
 
     async def _result(self, job_id, event):
@@ -333,9 +345,17 @@ class ChunkedPneumaTranscriber:
                     result = await self._request("GET", f"transcriptions/{job_id}/result")
                     if "job_id" in result and self._id(result["job_id"]) != job_id:
                         raise UploadError("Pneuma returned a different result ID")
-                    if str(result.get("status", "completed")).lower() in FAILED:
+                    result_status = result.get("status", "completed")
+                    if not isinstance(result_status, str):
+                        raise UploadError("Pneuma returned an invalid result status")
+                    result_status = result_status.lower()
+                    if result_status in FAILED:
                         raise UploadError("Pneuma processing failed")
-                    if result.get("ready") is False:
+                    if result_status not in SUCCESS | PENDING:
+                        raise UploadError("Pneuma returned an unknown result status")
+                    if "ready" in result and type(result["ready"]) is not bool:
+                        raise UploadError("Pneuma returned an invalid result readiness")
+                    if result.get("ready") is False or result_status in PENDING:
                         event.poll_count += 1
                         await asyncio.sleep(self.config.poll_interval)
                         continue

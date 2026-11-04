@@ -86,10 +86,10 @@ async def test_telegram_sdk_normalization_send_keyboard_and_download():
     bot.send_message = AsyncMock(return_value=tg_message(text="ok"))
     bot.get_file = AsyncMock(return_value=SimpleNamespace(file_path="doc/test", file_size=3))
 
-    async def download(file_path, destination):
-        destination.write(b"abc")
+    async def download(**kwargs):
+        yield b"abc"
 
-    bot.download_file = AsyncMock(side_effect=download)
+    bot.session.stream_content = download
     adapter = TelegramAdapter(bot=bot)
     original = tg_message(
         caption="Файл",
@@ -119,11 +119,11 @@ async def test_telegram_streamed_download_limit():
     bot = Bot("123456789:abcdefghijklmnopqrstuvwxyz123456789")
     bot.get_file = AsyncMock(return_value=SimpleNamespace(file_path="x", file_size=None))
 
-    async def download(file_path, destination):
-        destination.write(b"123")
-        destination.write(b"456")
+    async def download(**kwargs):
+        yield b"123"
+        yield b"456"
 
-    bot.download_file = AsyncMock(side_effect=download)
+    bot.session.stream_content = download
     adapter = TelegramAdapter(bot=bot, max_attachment_bytes=4)
     with pytest.raises(ValueError):
         await adapter._download("file-id")
@@ -194,10 +194,10 @@ async def test_audio_attachment_download_to_pneuma(platform, kind):
                 return_value=SimpleNamespace(file_path="audio/test", file_size=len(audio))
             )
 
-            async def download_tg(file_path, destination):
-                destination.write(audio)
+            async def download_tg(**kwargs):
+                yield audio
 
-            bot.download_file = AsyncMock(side_effect=download_tg)
+            bot.session.stream_content = download_tg
             adapter = TelegramAdapter(bot=bot)
             media = {"file_id": "f", "file_unique_id": "u", "duration": 1, "file_size": len(audio)}
             if kind != "voice":
@@ -214,8 +214,8 @@ async def test_audio_attachment_download_to_pneuma(platform, kind):
             media_kind = {"voice": "audio_message", "document": "doc"}.get(kind, kind)
             if kind == "voice":
                 media.update(
-                    link_ogg="https://files.test/voice.ogg",
-                    link_mp3="https://files.test/voice.mp3",
+                    link_ogg="https://files.userapi.com/voice.ogg",
+                    link_mp3="https://files.userapi.com/voice.mp3",
                     waveform=[1],
                 )
             elif kind == "document":
@@ -225,10 +225,10 @@ async def test_audio_attachment_download_to_pneuma(platform, kind):
                     ext="mp3",
                     date=1,
                     type=1,
-                    url="https://files.test/a.mp3",
+                    url="https://files.userapi.com/a.mp3",
                 )
             else:
-                media.update(artist="Test", title="message", url="https://files.test/a.mp3")
+                media.update(artist="Test", title="message", url="https://files.userapi.com/a.mp3")
             original = VKMessage.model_validate(
                 {
                     "conversation_message_id": 1,
@@ -300,7 +300,7 @@ async def test_vk_sdk_message_attachments_identity_and_callback():
                             "ext": "txt",
                             "date": 1,
                             "type": 1,
-                            "url": "https://files.test/test.txt",
+                            "url": "https://files.userapi.com/test.txt",
                         },
                     }
                 ],
@@ -352,16 +352,16 @@ async def test_vk_document_upload_uses_real_sdk():
     await adapter.aclose()
 
 
-async def test_vk_http_download_bound_and_no_redirect():
+async def test_vk_http_download_bound_and_requires_https():
     api, _ = vk_api()
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda r: httpx.Response(200, content=b"12345"))
     ) as client:
         adapter = VKAdapter(bot=VKBot(api=api), download_client=client, max_attachment_bytes=3)
         with pytest.raises(ValueError):
-            await adapter._download("https://files.test/a")
+            await adapter._download("https://files.userapi.com/a")
         with pytest.raises(ValueError):
-            await adapter._download("http://files.test/a")
+            await adapter._download("http://files.userapi.com/a")
         await adapter.aclose()
 
 

@@ -60,6 +60,8 @@ class BaseAdapter:
         bot_id: str = "bot",
         max_attachment_bytes: int = 20 * 1024 * 1024,
     ):
+        if type(max_attachment_bytes) is not int or max_attachment_bytes <= 0:
+            raise ValueError("max_attachment_bytes must be a positive integer")
         self.tracker = tracker
         self.bot_id = bot_id
         self.max_attachment_bytes = max_attachment_bytes
