@@ -30,11 +30,30 @@ EXTENSIONS = {
     ".html": "text/html",
     ".htm": "text/html",
     ".xml": "application/xml",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".flac": "audio/flac",
+    ".aac": "audio/aac",
+    ".wma": "audio/x-ms-wma",
 }
 
 
-def detect_mime(data: bytes, declared: str, filename: str | None, config: ExtractionConfig) -> str:
-    declared = declared.split(";", 1)[0].strip().lower()
+def _declared_mime(value: str | None) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ExtractionError("Attachment MIME type must be text")
+    return value.split(";", 1)[0].strip().lower()
+
+
+def detect_mime(data: bytes, declared: str | None, filename: str | None, config: ExtractionConfig) -> str:
+    declared = _declared_mime(declared)
+    if filename is not None and not isinstance(filename, str):
+        raise ExtractionError("Attachment filename must be text")
     if data.lstrip().startswith(b"%PDF-"):
         return "application/pdf"
     signatures = [
@@ -44,12 +63,17 @@ def detect_mime(data: bytes, declared: str, filename: str | None, config: Extrac
         (b"II*\x00", "image/tiff"),
         (b"MM\x00*", "image/tiff"),
         (b"BM", "image/bmp"),
+        (b"OggS", "audio/ogg"),
+        (b"fLaC", "audio/flac"),
+        (b"ID3", "audio/mpeg"),
     ]
     for signature, mime in signatures:
         if data.startswith(signature):
             return mime
     if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
         return "image/webp"
+    if data.startswith(b"RIFF") and data[8:12] == b"WAVE":
+        return "audio/wav"
     if data.startswith(b"PK\x03\x04"):
         names = inspect_archive(data, config)
         for name, mime in (
@@ -64,13 +88,27 @@ def detect_mime(data: bytes, declared: str, filename: str | None, config: Extrac
         raise UnsupportedContentError("Legacy or encrypted Office document; export as PDF/DOCX/XLSX/PPTX")
     if declared in {"", "application/octet-stream", "binary/octet-stream"}:
         return EXTENSIONS.get(PurePath(filename or "").suffix.lower(), declared)
-    return {"image/jpg": "image/jpeg", "application/x-pdf": "application/pdf"}.get(declared, declared)
+    return {
+        "image/jpg": "image/jpeg",
+        "application/x-pdf": "application/pdf",
+        "audio/mp3": "audio/mpeg",
+        "audio/x-mp3": "audio/mpeg",
+        "audio/x-mpeg": "audio/mpeg",
+        "application/ogg": "audio/ogg",
+        "audio/opus": "audio/ogg",
+        "audio/x-flac": "audio/flac",
+        "audio/x-m4a": "audio/mp4",
+        "audio/x-wav": "audio/wav",
+    }.get(declared, declared)
 
 
 class ContentExtractionService:
     """Concrete A5 service; custom registered extractors take precedence.
 
-    The supplied LLM/tracker belong to the caller. No private client is created.
+    The supplied LLM/transcriber/tracker belong to the caller. No private client is created.
+    Byte limits are checked before parsing; streaming download limits belong to
+    the attachment's transport. Cancelling a to_thread parser does not terminate
+    its running worker/native library; untrusted workloads also need OS limits.
     """
 
     def __init__(
@@ -106,7 +144,7 @@ class ContentExtractionService:
         return await self.extract_bytes(data, attachment.mime_type, filename=attachment.filename)
 
     async def extract_bytes(
-        self, data: bytes, mime_type: str, *, filename: str | None = None
+        self, data: bytes, mime_type: str | None, *, filename: str | None = None
     ) -> ExtractedContent:
         started = time.perf_counter()
         event = UsageEvent(kind="extraction", operation="extract", cost_status="NOT_APPLICABLE")
@@ -129,7 +167,7 @@ class ContentExtractionService:
                         if result.text is not None:
                             self.config.check_text(result.text)
                         result.metadata.update(mime_type=detected, byte_count=len(data), source_sha256=digest)
-                        if detected != mime_type.split(";", 1)[0].strip().lower():
+                        if detected != _declared_mime(mime_type):
                             result.warnings.append("mime_type_inferred_from_content_or_filename")
                         event.meta.update(
                             warning_count=len(result.warnings),

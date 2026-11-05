@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import csv as csv_module
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from botkit.rag.base import Chunk, IngestReport, OnProgress
 from botkit.rag.quality import page_quality_warning
@@ -18,7 +18,7 @@ from botkit.rag.splitting import sentence_aware_chunks
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def ingest_csv(
@@ -33,23 +33,39 @@ def ingest_csv(
     warnings: list[str] = []
     errors: list[str] = []
 
-    with open(csv_path, newline="", encoding="utf-8") as f:
+    # UTF-8 BOM is common in spreadsheet exports. Normalize the actual reader
+    # keys, not only the header validation, or padded `text` columns are lost.
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv_module.DictReader(f)
         if reader.fieldnames is None:
             raise ValueError(f"CSV has no header row: {csv_path}")
 
-        fields = {name: name.strip() for name in reader.fieldnames}
-        if "source" not in fields.values():
+        fields = [name.strip() for name in reader.fieldnames]
+        if len(set(fields)) != len(fields):
+            raise ValueError(f"CSV has duplicate normalized column names: {csv_path}")
+        reader.fieldnames = fields
+        if "source" not in fields:
             raise ValueError(
                 f"CSV is missing required 'source' column: {csv_path}"
             )
-        if "text" not in fields.values():
+        if "text" not in fields:
             raise ValueError(f"CSV is missing required 'text' column: {csv_path}")
 
         ingested_at = _now_iso()
-        total_rows = sum(1 for _ in open(csv_path, encoding="utf-8")) - 1  # минус заголовок
+        total_rows = 0
+        if on_progress is not None:
+            # Count logical CSV records, not physical lines inside quoted text.
+            with open(csv_path, newline="", encoding="utf-8-sig") as count_file:
+                total_rows = sum(1 for _ in csv_module.DictReader(count_file))
 
         for row_idx, row in enumerate(reader):
+            if None in row:
+                # DictReader puts extra cells into a list under None. Never
+                # call .strip() on it or silently ingest a truncated record.
+                errors.append(f"extra_columns_row_{row_idx}")
+                if on_progress is not None:
+                    on_progress(row_idx + 1, total_rows)
+                continue
             text = (row.get("text") or "").strip()
             if not text:
                 warnings.append(f"empty_text_row_{row_idx}")
@@ -59,8 +75,7 @@ def ingest_csv(
 
             metadata: dict = {}
             source_value = ""
-            for raw_key, value in row.items():
-                key = fields.get(raw_key, raw_key)
+            for key, value in row.items():
                 if key == "text":
                     continue
                 clean_value = (value or "").strip()

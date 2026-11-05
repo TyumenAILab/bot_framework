@@ -11,9 +11,18 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from botkit.llm import FallbackLLM, LLMConfig, LLMGateway
-from botkit.transport import CallbackQuery, IncomingMessage, MemoryAdapter
-from botkit.usage import SQLiteUsageTracker
+from botkit.llm import (
+    FallbackLLM,
+    LLMConfig,
+    LLMGateway,
+    LLMResponse,
+    PneumaConfig,
+    PneumaTranscriber,
+    TranscriptionPipeline,
+    TranscriptResult,
+)
+from botkit.transport import Attachment, CallbackQuery, IncomingMessage, MemoryAdapter
+from botkit.usage import SQLiteUsageTracker, usage_context
 
 spec = importlib.util.spec_from_file_location(
     "acceptance_harness", Path(__file__).parents[1] / "scripts" / "acceptance.py"
@@ -304,3 +313,57 @@ async def test_existing_webhook_does_not_start_polling_or_delete_webhook(
     adapter.send.assert_not_awaited()
     adapter.run.assert_not_awaited()
     adapter.aclose.assert_awaited_once()
+
+
+async def test_messenger_pneuma_asr_cases_and_shared_budget(report, fixtures, tracker):
+    def server(request):
+        if request.method == "POST":
+            return httpx.Response(200, json={"job_id": "d" * 32, "status": "completed"})
+        return httpx.Response(
+            200, json={"status": "completed", "ready": True, "transcript": "Private speech"}
+        )
+
+    adapter = MemoryAdapter(tracker=tracker, bot_id="acceptance")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as client:
+        asr = PneumaTranscriber(PneumaConfig("https://asr.test"), client=client, tracker=tracker)
+        session = harness.MessengerSession(
+            adapter, object(), tracker, report, fixtures, max_calls=2, transcriber=asr
+        )
+        for i, (mime, name) in enumerate([("audio/ogg", None), ("application/octet-stream", "voice.mp3")]):
+            with usage_context(bot_id="acceptance", skill_context="messenger_session"):
+                await adapter.dispatch(
+                    IncomingMessage(
+                        "memory",
+                        "u",
+                        "c",
+                        "",
+                        message_id=str(i),
+                        attachments=[
+                            Attachment("audio", mime, AsyncMock(return_value=b"audio"), filename=name)
+                        ],
+                    )
+                )
+        assert not {"messenger:voice_in", "messenger:mp3_in"}.intersection(report.data["missing"])
+        assert not any(c["status"] == "failed" for c in report.data["cases"])
+        assert harness.successful_llm_check(report)
+        assert (await harness.usage_check(tracker, require_llm=True))["llm_events"] == 2
+        with pytest.raises(harness.CheckFailure, match="budget"):
+            await session.llm.ainvoke("prompt")
+        assert "Private speech" not in json.dumps(report.data)
+    await adapter.aclose()
+
+
+async def test_pipeline_reserves_asr_and_llm_budget_before_upload():
+    asr, processor = AsyncMock(), AsyncMock()
+    asr.atranscribe.return_value = LLMResponse("речь", "речь", "raw_text_fallback")
+    processor.aprocess.return_value = TranscriptResult("Речь.", True)
+    pipeline = TranscriptionPipeline(asr, processor)
+    budget = harness.BudgetLLM(object(), 1, pipeline)
+    with pytest.raises(harness.CheckFailure, match="budget"):
+        await budget.atranscribe(b"voice", mime_type="audio/ogg", filename="a.ogg")
+    asr.atranscribe.assert_not_awaited()
+    assert budget.used == 0
+    budget.limit = 2
+    assert (await budget.atranscribe(b"voice", mime_type="audio/ogg", filename="a.ogg")).response == "Речь."
+    assert budget.used == 2
+    processor.aprocess.assert_awaited_once()

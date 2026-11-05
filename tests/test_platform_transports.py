@@ -12,6 +12,8 @@ from vkbottle import API
 from vkbottle import Bot as VKBot
 from vkbottle.bot import Message as VKMessage
 
+from botkit.extraction import ContentExtractionService
+from botkit.llm import PneumaConfig, PneumaTranscriber
 from botkit.transport import Attachment, Button, CallbackQuery, IncomingMessage, MemoryAdapter
 from botkit.transport.base import split_text
 from botkit.transport.telegram import TelegramAdapter
@@ -84,10 +86,10 @@ async def test_telegram_sdk_normalization_send_keyboard_and_download():
     bot.send_message = AsyncMock(return_value=tg_message(text="ok"))
     bot.get_file = AsyncMock(return_value=SimpleNamespace(file_path="doc/test", file_size=3))
 
-    async def download(file_path, destination):
-        destination.write(b"abc")
+    async def download(**kwargs):
+        yield b"abc"
 
-    bot.download_file = AsyncMock(side_effect=download)
+    bot.session.stream_content = download
     adapter = TelegramAdapter(bot=bot)
     original = tg_message(
         caption="Файл",
@@ -117,11 +119,11 @@ async def test_telegram_streamed_download_limit():
     bot = Bot("123456789:abcdefghijklmnopqrstuvwxyz123456789")
     bot.get_file = AsyncMock(return_value=SimpleNamespace(file_path="x", file_size=None))
 
-    async def download(file_path, destination):
-        destination.write(b"123")
-        destination.write(b"456")
+    async def download(**kwargs):
+        yield b"123"
+        yield b"456"
 
-    bot.download_file = AsyncMock(side_effect=download)
+    bot.session.stream_content = download
     adapter = TelegramAdapter(bot=bot, max_attachment_bytes=4)
     with pytest.raises(ValueError):
         await adapter._download("file-id")
@@ -163,6 +165,94 @@ def vk_api():
     client = SimpleNamespace(request_text=AsyncMock(), close=AsyncMock())
     client.request_text.return_value = json.dumps({"response": 77})
     return API("test-token", http_client=client), client
+
+
+@pytest.mark.parametrize("platform", ["telegram", "vk"])
+@pytest.mark.parametrize("kind", ["voice", "audio", "document"])
+async def test_audio_attachment_download_to_pneuma(platform, kind):
+    audio = b"OggSvoice" if kind == "voice" else b"ID3music"
+    transcript = "Распознанная речь"
+    uploaded = []
+
+    def asr_server(request):
+        if request.method == "POST":
+            uploaded.append(request.content)
+            return httpx.Response(200, json={"job_id": "c" * 32, "status": "completed"})
+        return httpx.Response(200, json={"status": "completed", "ready": True, "transcript": transcript})
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(asr_server)) as asr_http,
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, content=audio))
+        ) as download,
+    ):
+        asr = PneumaTranscriber(PneumaConfig("https://asr.test", trust_env=False), client=asr_http)
+        service = ContentExtractionService(transcriber=asr)
+        if platform == "telegram":
+            bot = Bot("123456789:abcdefghijklmnopqrstuvwxyz123456789")
+            bot.get_file = AsyncMock(
+                return_value=SimpleNamespace(file_path="audio/test", file_size=len(audio))
+            )
+
+            async def download_tg(**kwargs):
+                yield audio
+
+            bot.session.stream_content = download_tg
+            adapter = TelegramAdapter(bot=bot)
+            media = {"file_id": "f", "file_unique_id": "u", "duration": 1, "file_size": len(audio)}
+            if kind != "voice":
+                media.update(
+                    file_name="message.mp3",
+                    mime_type="application/octet-stream" if kind == "document" else "audio/mpeg",
+                )
+            incoming = adapter.normalize(tg_message(**{kind: media}))
+        else:
+            api, api_http = vk_api()
+            api_http.request_text.return_value = json.dumps({"response": [{"id": 20, "first_name": "Test"}]})
+            adapter = VKAdapter(bot=VKBot(api=api), download_client=download)
+            media = {"id": 1, "owner_id": 20, "duration": 1}
+            media_kind = {"voice": "audio_message", "document": "doc"}.get(kind, kind)
+            if kind == "voice":
+                media.update(
+                    link_ogg="https://files.userapi.com/voice.ogg",
+                    link_mp3="https://files.userapi.com/voice.mp3",
+                    waveform=[1],
+                )
+            elif kind == "document":
+                media.update(
+                    title="message.mp3",
+                    size=len(audio),
+                    ext="mp3",
+                    date=1,
+                    type=1,
+                    url="https://files.userapi.com/a.mp3",
+                )
+            else:
+                media.update(artist="Test", title="message", url="https://files.userapi.com/a.mp3")
+            original = VKMessage.model_validate(
+                {
+                    "conversation_message_id": 1,
+                    "date": 1,
+                    "from_id": 20,
+                    "id": 2,
+                    "text": "",
+                    "version": 1,
+                    "out": False,
+                    "peer_id": 10,
+                    "attachments": [{"type": media_kind, media_kind: media}],
+                }
+            )
+            incoming = await adapter.normalize(original)
+        try:
+            assert len(incoming.attachments) == 1
+            result = await service.extract(incoming.attachments[0])
+            assert result.text == transcript and result.kind == "transcript"
+            assert len(uploaded) == 1 and audio in uploaded[0]
+            assert b'name="audio"' in uploaded[0]
+        finally:
+            await adapter.aclose()
+            if platform == "telegram":
+                await bot.session.close()
 
 
 async def test_vk_sdk_raw_envelope_send_and_random_ids():
@@ -210,7 +300,7 @@ async def test_vk_sdk_message_attachments_identity_and_callback():
                             "ext": "txt",
                             "date": 1,
                             "type": 1,
-                            "url": "https://files.test/test.txt",
+                            "url": "https://files.userapi.com/test.txt",
                         },
                     }
                 ],
@@ -262,16 +352,16 @@ async def test_vk_document_upload_uses_real_sdk():
     await adapter.aclose()
 
 
-async def test_vk_http_download_bound_and_no_redirect():
+async def test_vk_http_download_bound_and_requires_https():
     api, _ = vk_api()
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda r: httpx.Response(200, content=b"12345"))
     ) as client:
         adapter = VKAdapter(bot=VKBot(api=api), download_client=client, max_attachment_bytes=3)
         with pytest.raises(ValueError):
-            await adapter._download("https://files.test/a")
+            await adapter._download("https://files.userapi.com/a")
         with pytest.raises(ValueError):
-            await adapter._download("http://files.test/a")
+            await adapter._download("http://files.userapi.com/a")
         await adapter.aclose()
 
 

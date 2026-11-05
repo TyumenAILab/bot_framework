@@ -5,13 +5,14 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import AsyncExitStack
 from dataclasses import asdict
 
 import httpx
 from dotenv import load_dotenv
 
 from .extraction import ContentExtractionService, ExtractionConfig
-from .llm import LLMGateway, load_llm
+from .llm import LLMGateway, load_llm, load_transcriber
 from .llm.config import LLMConfig
 from .runtime import ChatBot, make_adapter
 from .transport import IncomingMessage, MemoryAdapter
@@ -88,7 +89,11 @@ async def execute(args: argparse.Namespace) -> None:
         return
     llm = load_llm(tracker=tracker)
     adapters = []
-    try:
+    async with AsyncExitStack() as stack:
+        stack.push_async_callback(llm.aclose)
+        transcriber = load_transcriber(tracker=tracker)
+        if transcriber is not None:
+            stack.push_async_callback(transcriber.aclose)
         for platform in args.platform:
             adapters.append(
                 make_adapter(
@@ -99,12 +104,11 @@ async def execute(args: argparse.Namespace) -> None:
                     max_attachment_bytes=int(os.getenv("MAX_ATTACHMENT_BYTES", str(20 * 1024 * 1024))),
                 )
             )
-        extraction = ContentExtractionService(llm, tracker=tracker, config=ExtractionConfig.from_env())
+            stack.push_async_callback(adapters[-1].aclose)
+        extraction = ContentExtractionService(
+            llm, tracker=tracker, config=ExtractionConfig.from_env(), transcriber=transcriber
+        )
         await ChatBot(llm, adapters, extraction=extraction).run()
-    finally:
-        for adapter in adapters:
-            await adapter.aclose()
-        await llm.aclose()
 
 
 def main() -> None:

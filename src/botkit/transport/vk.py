@@ -7,6 +7,7 @@ import mimetypes
 import secrets
 from collections import OrderedDict
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -14,6 +15,82 @@ from .base import Attachment, Button, CallbackQuery, IncomingMessage, split_text
 from .common import BaseAdapter
 
 logger = logging.getLogger(__name__)
+
+
+class VKAttachmentDownloadError(ValueError):
+    """Safe download diagnostic; never retains a signed URL or HTTP response."""
+
+    def __init__(self, stage: str, reason: str, status_code: int | None = None, *, violation: str = "unknown"):
+        self.stage = stage
+        self.reason = reason
+        self.status_code = status_code
+        # Fixed categorical detail only. Never retain a URL, hostname or headers.
+        self.violation = violation if violation in {
+            "unknown", "malformed", "fragment", "userinfo", "scheme", "port", "host"
+        } else "unknown"
+        super().__init__(f"VK attachment download failed: stage={stage} reason={reason} status={status_code}")
+
+
+# VK API attachment URLs and their CDN redirects form one explicit trust
+# boundary. Suffixes must match a DNS label, never a textual substring. TLS and
+# the system DNS resolver are trusted; this is not DNS pinning. A caller-supplied
+# HTTP client (including its transport/event hooks) is likewise trusted code.
+_DOWNLOAD_HOSTS = (
+    "vk.com",
+    "vk.ru",
+    "userapi.com",
+    "vkuser.net",
+    "vkuserphoto.ru",
+    "vkuseraudio.net",
+    "vk-cdn.net",
+    "vk-cdn.me",
+)
+_DOWNLOAD_REDIRECTS = {301, 302, 303, 307, 308}
+_DOWNLOAD_MAX_REDIRECTS = 5
+_DOWNLOAD_MAX_URL_LENGTH = 16384
+
+
+def _download_url(value: str, *, base: httpx.URL | None = None, status_code: int | None = None) -> httpx.URL:
+    stage = "validate" if base is None else "redirect"
+    violation = "malformed"
+    invalid = not isinstance(value, str) or not value or len(value) > _DOWNLOAD_MAX_URL_LENGTH
+    if not invalid:
+        # Reject parser ambiguities before joining/canonicalising a Location.
+        invalid = any(ord(char) <= 32 or ord(char) == 127 for char in value) or "\\" in value
+    if not invalid:
+        try:
+            # URL fragments are client-side only and never belong in an HTTP
+            # request. Remove them *before* parsing or resolving; do not let a
+            # fragment influence the scheme, authority or allowlist checks.
+            request_value = value.split("#", 1)[0]
+            invalid = not request_value and base is None
+            has_userinfo = "@" in urlsplit(request_value).netloc  # includes empty userinfo
+            url = httpx.URL(request_value) if base is None else base.join(request_value)
+            host = url.host.lower()
+            if invalid:
+                violation = "malformed"
+            elif has_userinfo or url.userinfo:
+                invalid, violation = True, "userinfo"
+            elif url.scheme != "https" or not url.is_absolute_url:
+                invalid, violation = True, "scheme"
+            elif url.port not in {None, 443}:
+                invalid, violation = True, "port"
+            elif not any(host == domain or host.endswith("." + domain) for domain in _DOWNLOAD_HOSTS):
+                invalid, violation = True, "host"
+        except (ValueError, httpx.InvalidURL):
+            invalid = True
+    if invalid:
+        raise VKAttachmentDownloadError(stage, "unsafe_url", status_code, violation=violation) from None
+    return url
+
+
+def _message_id(value: str, *, local_key: str, global_key: str) -> dict[str, int]:
+    encoded = str(value)
+    local = encoded.startswith("cmid:")
+    number = encoded[5:] if local else encoded
+    if not number or len(number) > 20 or not number.isascii() or not number.isdecimal() or int(number) <= 0:
+        raise ValueError("VK message ID must be a positive numeric ID or cmid:N")
+    return {local_key if local else global_key: int(number)}
 
 
 class VKAdapter(BaseAdapter):
@@ -36,10 +113,12 @@ class VKAdapter(BaseAdapter):
         self.labeler = self.native.labeler
         self._owns_bot = bot is None
         self._owns_downloads = download_client is None
-        self._downloads = download_client or httpx.AsyncClient(timeout=60, follow_redirects=False)
+        self._downloads = download_client or httpx.AsyncClient(
+            timeout=60, follow_redirects=False, trust_env=False
+        )
         self._users: OrderedDict[int, tuple[str | None, str | None]] = OrderedDict()
-        self.labeler.message()(self._receive)
-        self.labeler.raw_event("message_event")(self._receive_callback)
+        self.labeler.message(blocking=False)(self._receive)
+        self.labeler.raw_event("message_event", blocking=False)(self._receive_callback)
 
     async def call_api(self, method: str, **params: Any) -> Any:
         """Full VK API by dotted method name; .api also exposes typed SDK methods."""
@@ -135,12 +214,20 @@ class VKAdapter(BaseAdapter):
         if buttons is not None:
             options["keyboard"] = self._keyboard(buttons)
         return await self.call_api(
-            "messages.edit", peer_id=int(chat_id), message_id=int(message_id), message=text, **options
+            "messages.edit",
+            peer_id=int(chat_id),
+            message=text,
+            **_message_id(message_id, local_key="cmid", global_key="message_id"),
+            **options,
         )
 
     async def delete(self, chat_id: str, message_id: str, **options: Any) -> Any:
         return await self.call_api(
-            "messages.delete", peer_id=int(chat_id), message_ids=message_id, delete_for_all=1, **options
+            "messages.delete",
+            peer_id=int(chat_id),
+            delete_for_all=1,
+            **_message_id(message_id, local_key="cmids", global_key="message_ids"),
+            **options,
         )
 
     async def answer_callback(self, callback: CallbackQuery, text: str = "", **options: Any) -> Any:
@@ -155,18 +242,73 @@ class VKAdapter(BaseAdapter):
         )
 
     async def _download(self, url: str) -> bytes:
-        if not url.startswith("https://"):
-            raise ValueError("VK attachment download requires an HTTPS URL")
-        async with self._downloads.stream("GET", url) as response:
-            response.raise_for_status()
-            if int(response.headers.get("content-length", "0")) > self.max_attachment_bytes:
-                raise ValueError("Attachment exceeds the configured size limit")
-            result = bytearray()
-            async for chunk in response.aiter_bytes():
-                if len(result) + len(chunk) > self.max_attachment_bytes:
-                    raise ValueError("Attachment exceeds the configured size limit")
-                result.extend(chunk)
-            return bytes(result)
+        current = _download_url(url)
+        visited = {str(current)}
+        stage, status = "request", None
+        try:
+            for hop in range(_DOWNLOAD_MAX_REDIRECTS + 1):
+                stage, status = "request", None
+                # Do not use build_request/stream: those merge the injected
+                # client's default Authorization, Cookie and Referer headers.
+                # Start clean on *every* hop, even same-origin redirects.
+                request = httpx.Request(
+                    "GET", current, headers={"Accept": "*/*", "Accept-Encoding": "identity"}
+                )
+                response = await self._downloads.send(request, stream=True, follow_redirects=False, auth=None)
+                try:
+                    status = response.status_code
+                    if status in _DOWNLOAD_REDIRECTS:
+                        stage = "redirect"
+                        locations = response.headers.get_list("location")
+                        if len(locations) != 1 or not locations[0]:
+                            raise VKAttachmentDownloadError(stage, "invalid_location", status)
+                        if hop >= _DOWNLOAD_MAX_REDIRECTS:
+                            raise VKAttachmentDownloadError(stage, "redirect_limit", status)
+                        target = _download_url(locations[0], base=current, status_code=status)
+                        if str(target) in visited:
+                            raise VKAttachmentDownloadError(stage, "redirect_loop", status)
+                        visited.add(str(target))
+                        current = target
+                        continue
+                    if not 200 <= status < 300:
+                        # raise_for_status would retain/request-print the entire
+                        # signed URL, response and possibly redirect history.
+                        raise VKAttachmentDownloadError(stage, "http_status", status)
+                    stage = "read"
+                    # HTTPX decodes compression before yielding aiter_bytes;
+                    # a tiny compressed chunk can allocate far beyond our cap.
+                    # We requested identity, so reject unexpected compression
+                    # before reading any response body instead of decompressing.
+                    encoding = response.headers.get("content-encoding", "identity").strip().casefold()
+                    if encoding != "identity":
+                        raise VKAttachmentDownloadError(stage, "unsupported_encoding", status)
+                    stage = "size"
+                    declared_length = response.headers.get("content-length")
+                    if declared_length is not None:
+                        if (
+                            not 1 <= len(declared_length) <= 20
+                            or not declared_length.isascii()
+                            or not declared_length.isdecimal()
+                        ):
+                            raise VKAttachmentDownloadError(stage, "invalid_length", status)
+                        if int(declared_length) > self.max_attachment_bytes:
+                            raise VKAttachmentDownloadError(stage, "size_limit", status)
+                    result = bytearray()
+                    stage = "read"
+                    async for chunk in response.aiter_bytes():
+                        if len(result) + len(chunk) > self.max_attachment_bytes:
+                            raise VKAttachmentDownloadError("size", "size_limit", status)
+                        result.extend(chunk)
+                    return bytes(result)
+                finally:
+                    await response.aclose()
+        except VKAttachmentDownloadError:
+            raise
+        except Exception:
+            # Raise outside the except suite: do not retain the raw exception
+            # as __context__, since it can contain URL, headers or document data.
+            safe_error = VKAttachmentDownloadError(stage, "transport_error", status)
+        raise safe_error from None
 
     async def _identity(self, user_id: int) -> tuple[str | None, str | None]:
         if user_id <= 0:
@@ -245,14 +387,25 @@ class VKAdapter(BaseAdapter):
                 payload = json.loads(payload)
             except ValueError:
                 payload = {"data": payload}
+        if not isinstance(payload, dict):
+            payload = {}
+        data = payload.get("data", "")
+        if not isinstance(data, str):
+            data = ""
+        local_id = value.get("conversation_message_id")
+        message_id = None
+        if local_id is not None:
+            message_id = "cmid:" + str(
+                _message_id(str(local_id), local_key="cmid", global_key="cmid")["cmid"]
+            )
         await self.dispatch_callback(
             CallbackQuery(
                 platform=self.platform,
                 callback_id=value["event_id"],
                 user_id=str(value["user_id"]),
                 chat_id=str(value["peer_id"]),
-                data=str(payload.get("data", "")),
-                message_id=str(value.get("conversation_message_id", "")),
+                data=data,
+                message_id=message_id,
                 raw=event,
             )
         )
@@ -286,8 +439,12 @@ class VKAdapter(BaseAdapter):
             await self.aclose()
 
     async def aclose(self) -> None:
-        await super().aclose()
-        if self._owns_downloads:
-            await self._downloads.aclose()
-        if self._owns_bot:
-            await self.api.http_client.close()
+        try:
+            await super().aclose()
+        finally:
+            try:
+                if self._owns_downloads:
+                    await self._downloads.aclose()
+            finally:
+                if self._owns_bot:
+                    await self.api.http_client.close()

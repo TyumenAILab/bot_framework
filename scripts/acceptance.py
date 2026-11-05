@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 from botkit.extraction import ContentExtractionService, ExtractionConfig, render_pdf
 from botkit.extraction.documents import DOCX
-from botkit.llm import FallbackLLM, LLMGateway, load_llm
+from botkit.llm import FallbackLLM, LLMGateway, TranscriptionPipeline, load_llm, load_transcriber
 from botkit.transport import Button
 from botkit.usage import PriceBook, SQLiteUsageTracker, usage_context
 
@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MARKER = "BOTKIT-7319"
 KNOWN_LIMITS = [
     "This is smoke acceptance, not full domain or all-method API certification.",
-    "Native-handler interception and VK callback message IDs need regression checks.",
+    "SDK dispatch and VK callback IDs are checked offline; live delivery still needs acceptance.",
     "Messenger attachment normalization does not cover all platform media types.",
     "Cost must be reconciled with provider billing; unknown cost is not zero.",
 ]
@@ -404,7 +404,8 @@ def successful_llm_check(report):
         case["status"] == "passed"
         and (
             case["name"].startswith(("provider_", "configured_chain:", "forced_fallback:"))
-            or case["name"] in {"messenger:llm", "messenger:image_in", "messenger:pdf_scan_in"}
+            or case["name"]
+            in {"messenger:llm", "messenger:image_in", "messenger:pdf_scan_in", "messenger:asr"}
         )
         for case in report.data["cases"]
     )
@@ -413,13 +414,17 @@ def successful_llm_check(report):
 class BudgetLLM:
     """Limit logical user-triggered calls; retries/fallback can multiply physical calls."""
 
-    def __init__(self, llm, limit):
+    def __init__(self, llm, limit, transcriber=None):
         self.llm, self.limit, self.used = llm, limit, 0
+        self.transcriber = transcriber
 
     async def _call(self, method, *args, **kwargs):
-        require(self.used < self.limit, "session_llm_budget_exhausted")
-        self.used += 1  # no await before reservation
-        return await getattr(self.llm, method)(*args, **kwargs)
+        target = self.transcriber if method == "atranscribe" else self.llm
+        # Reserve both ASR and optional transcript LLM before any upload starts.
+        cost = 2 if method == "atranscribe" and isinstance(target, TranscriptionPipeline) else 1
+        require(self.used + cost <= self.limit, "session_llm_budget_exhausted")
+        self.used += cost  # no await before reservation
+        return await getattr(target, method)(*args, **kwargs)
 
     async def ainvoke(self, *args, **kwargs):
         return await self._call("ainvoke", *args, **kwargs)
@@ -427,15 +432,19 @@ class BudgetLLM:
     async def ainvoke_with_image_b64(self, *args, **kwargs):
         return await self._call("ainvoke_with_image_b64", *args, **kwargs)
 
+    async def atranscribe(self, *args, **kwargs):
+        return await self._call("atranscribe", *args, **kwargs)
+
 
 class MessengerSession:
-    def __init__(self, adapter, llm, tracker, report, fixtures, *, max_calls=10):
+    def __init__(self, adapter, llm, tracker, report, fixtures, *, max_calls=10, transcriber=None):
         self.adapter, self.tracker, self.report, self.fixtures = adapter, tracker, report, fixtures
-        self.llm = BudgetLLM(llm, max_calls)
+        self.llm = BudgetLLM(llm, max_calls, transcriber)
         self.extraction = ContentExtractionService(
             self.llm,
             tracker=tracker,
             config=replace(ExtractionConfig.from_env(), max_pages=3, max_vision_pages=2),
+            transcriber=self.llm if transcriber is not None else None,
         )
         self.done, self.lock = asyncio.Event(), asyncio.Lock()
         self.seen = set()
@@ -458,6 +467,8 @@ class MessengerSession:
             "messenger:image_in",
             "messenger:finish",
         )
+        if transcriber is not None:
+            report.expect("messenger:voice_in", "messenger:mp3_in")
         adapter.on_message(self.receive)
         for name in ("start", "smoke", "llm", "status", "finish"):
             adapter.on_command(name, self.receive)
@@ -474,7 +485,11 @@ class MessengerSession:
                 return
             if message.message_id:
                 self.seen.add(key)
-            await self.report.check("messenger:handle_event", lambda: self._receive(message), timeout=600)
+            await self.report.check(
+                "messenger:handle_event",
+                lambda: self._receive(message),
+                timeout=max(600, 3 * (self.extraction.config.audio_timeout + 10) + 60),
+            )
 
     async def _receive(self, message):
         command = (
@@ -487,6 +502,7 @@ class MessengerSession:
                 message.chat_id,
                 "Тест botkit: /smoke → нажмите кнопку → отправьте обычный текст → /llm. "
                 "Затем отправьте PDF, DOCX и PNG из папки fixtures (или свои тестовые файлы). "
+                "Если настроен ASR_PROVIDER=pneuma, отправьте также голосовое и MP3: они уйдут в Pneuma. "
                 "/status — результаты; /finish — сохранить отчёт и остановиться. "
                 "Изображения и сканы передаются настроенной модели; не отправляйте секретные файлы.",
             )
@@ -513,6 +529,9 @@ class MessengerSession:
                 async def extract(attachment=attachment):
                     result = await self.extraction.extract(attachment)
                     require(bool((result.text or "").strip()), "empty_attachment_extraction")
+                    if kind in {"voice", "mp3", "audio"}:
+                        require(result.kind == "transcript", "audio_not_recognized_as_transcript")
+                        self.report.record("messenger:asr", **content_details(result))
                     if kind == "pdf":
                         require(bool(result.metadata.get("page_count")), "pdf_not_recognized_as_pdf")
                         case = "pdf_scan_in" if result.metadata.get("vision_pages") else "pdf_text_in"
@@ -529,10 +548,21 @@ class MessengerSession:
                         if mime == DOCX or suffix == ".docx"
                         else "image"
                         if mime.startswith("image/")
+                        else "mp3"
+                        if mime in {"audio/mpeg", "audio/mp3"} or suffix == ".mp3"
+                        else "voice"
+                        if mime.split(";", 1)[0] in {"audio/ogg", "audio/opus", "application/ogg"}
+                        or suffix in {".ogg", ".opus", ".oga"}
+                        else "audio"
+                        if mime.startswith("audio/") or attachment.kind == "audio"
                         else "other"
                     )
                 )
-                passed = await self.report.check("messenger:" + kind + "_in", extract, timeout=400)
+                passed = await self.report.check(
+                    "messenger:" + kind + "_in",
+                    extract,
+                    timeout=max(400, self.extraction.config.audio_timeout + 10),
+                )
                 await self.tell(
                     message.chat_id,
                     f"Вложение ({kind}): {'PASS' if passed else 'FAIL'}. Текст файла в отчёт не записывается.",
@@ -607,7 +637,7 @@ class MessengerSession:
             await self.report.check("messenger:callback", answer)
 
 
-async def messenger_checks(args, report, chain, tracker, fixtures):
+async def messenger_checks(args, report, chain, tracker, fixtures, transcriber=None):
     from botkit.runtime import make_adapter
 
     token = os.getenv(args.mode.upper() + "_BOT_TOKEN", "")
@@ -617,7 +647,9 @@ async def messenger_checks(args, report, chain, tracker, fixtures):
         if args.mode == "telegram":
             info = await adapter.call_api("get_webhook_info")
             require(not info.url, "existing_webhook_stop_or_use_dedicated_test_bot")
-        session = MessengerSession(adapter, chain, tracker, report, fixtures, max_calls=args.max_calls)
+        session = MessengerSession(
+            adapter, chain, tracker, report, fixtures, max_calls=args.max_calls, transcriber=transcriber
+        )
         report.data["messenger_access"] = "all_users_and_chats"
         report.data["max_logical_model_calls"] = args.max_calls
         report.save()
@@ -665,7 +697,7 @@ def parser():
         "--seconds", type=int, default=900, help="Messenger session lifetime (default 15 minutes)"
     )
     result.add_argument(
-        "--max-calls", type=int, default=10, help="Maximum logical LLM calls in messenger mode"
+        "--max-calls", type=int, default=10, help="Maximum logical LLM + ASR calls in messenger mode"
     )
     return result
 
@@ -682,8 +714,11 @@ async def run(args, report):
         report.directory / "usage.sqlite3", prices=PriceBook(price_path), log_text=False
     )
     chain = None
+    transcriber = None
     try:
         if args.mode != "offline":
+            transcriber = load_transcriber(tracker=tracker)
+            report.data["asr_enabled"] = transcriber is not None
             chain = load_llm(tracker=tracker)
             providers = chain.providers if isinstance(chain, FallbackLLM) else [chain]
             report.data["providers"] = [
@@ -720,8 +755,10 @@ async def run(args, report):
             await model_checks(report, chain, fixtures, tracker)
         else:
             with usage_context(bot_id="acceptance", skill_context="messenger_session"):
-                await messenger_checks(args, report, chain, tracker, fixtures)
+                await messenger_checks(args, report, chain, tracker, fixtures, transcriber=transcriber)
     finally:
+        if transcriber is not None:
+            await transcriber.aclose()
         if chain is not None:
             await chain.aclose()
         if args.mode != "check":

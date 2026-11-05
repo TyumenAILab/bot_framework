@@ -182,7 +182,23 @@ EXTRACTION_VISION_TIMEOUT=180
 ## Аудио — отдельная возможность
 
 Наличие vision-модели не означает наличие распознавания речи. Зарегистрируйте
-ASR gateway только если сервер действительно поддерживает `/audio/transcriptions`:
+отдельный ASR. Для предоставленного сервера Pneuma уже есть готовый клиент:
+
+```python
+from botkit.llm import load_transcriber
+
+asr = load_transcriber(tracker=tracker)  # ASR_PROVIDER=pneuma, PNEUMA_BASE_URL в env
+extraction = ContentExtractionService(llm, transcriber=asr, tracker=tracker)
+# При завершении приложения: await asr.aclose(), если asr is not None.
+```
+
+Он загружает multipart `audio`, ждёт асинхронную задачу и возвращает транскрипт
+с таймкодами/спикерами сервера без переформулирования. Поддержаны прямой API и
+веб-прокси. Настройка, ограничения и отдельный тестовый скрипт — в
+[Pneuma ASR](Pneuma%20ASR.md). `python -m botkit run` подключает его из env автоматически.
+
+Для **другого** ASR gateway, действительно поддерживающего OpenAI
+`/audio/transcriptions`, остаётся прежний вариант:
 
 ```python
 from botkit.llm import LLMConfig, LLMGateway
@@ -193,7 +209,21 @@ asr = LLMGateway(LLMConfig(
 extraction = ContentExtractionService(llm, transcriber=asr, tracker=tracker)
 ```
 
-Поддерживаемые типы: WAV, MP3, OGG, M4A, FLAC, WebM, если их принимает ASR.
+Поддерживаемые MIME-типы: WAV, MP3, OGG/Opus, M4A, FLAC, WebM, AAC, WMA,
+если их принимает выбранный ASR. MP3 и другие аудиофайлы с MIME
+`application/octet-stream` определяются по расширению; OGG/WAV/FLAC/MP3 с ID3
+также по сигнатуре. `.opus` направляется как OGG. Голосовые Telegram/VK уже
+нормализуются адаптерами в аудиовложения. Отдельный таймаут аудио:
+`EXTRACTION_AUDIO_TIMEOUT=600`, не `EXTRACTION_VISION_TIMEOUT`.
+Через `load_transcriber()` можно включить resumable-загрузку Pneuma и доработку
+транскрипта локальной LLM: `PNEUMA_UPLOAD_PROTOCOL=chunked`,
+`ASR_POSTPROCESS_ENABLED=true`. [Подробности и API](Pneuma%20ASR.md#новый-протокол-и-доработка-llm).
+A5 использует `LLMResponse.response` (обработанный текст), не `raw` (исходный ASR).
+В metadata добавляются `postprocessed`, `postprocess_reason`, `postprocessor_model`;
+в warnings — `audio_transcript_postprocessed` или `audio_transcript_postprocess_skipped`.
+Общий `EXTRACTION_AUDIO_TIMEOUT` включает ASR и доработку; отдельные дедлайны
+`PNEUMA_TIMEOUT` и `ASR_POSTPROCESS_TIMEOUT` также действуют.
+
 Транскрипт имеет `kind=transcript`, confidence `low`. Без ASR аудио даёт
 понятную ошибку; автоматически отправлять его в Qwen нельзя. Закрытие `asr`
 выполняет владелец. Этот путь проверен протокольными тестами, не реальной ASR-моделью.

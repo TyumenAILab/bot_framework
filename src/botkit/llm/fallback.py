@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
@@ -38,7 +39,7 @@ def validate_json_response(response: LLMResponse) -> None:
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", response.raw.strip(), flags=re.IGNORECASE)
     try:
         json.loads(text)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         raise InvalidLLMResponse("Model did not return valid JSON") from None
 
 
@@ -55,8 +56,13 @@ class FallbackLLM:
         primary_timeout: float = 90,
         validator: ResponseValidator | None = None,
     ):
-        if timeout <= 0 or primary_timeout <= 0:
-            raise ValueError("Timeouts must be positive")
+        if (
+            not math.isfinite(timeout)
+            or not math.isfinite(primary_timeout)
+            or timeout <= 0
+            or primary_timeout <= 0
+        ):
+            raise ValueError("Timeouts must be finite and positive")
         self.providers = [primary, *fallbacks]
         self.model_name = primary.model_name
         self.tracker, self.timeout, self.primary_timeout = tracker, timeout, primary_timeout
@@ -85,8 +91,8 @@ class FallbackLLM:
         **options: Any,
     ) -> LLMResponse:
         budget = self.timeout if timeout is None else timeout
-        if budget <= 0:
-            raise ValueError("timeout must be positive")
+        if not math.isfinite(budget) or budget <= 0:
+            raise ValueError("timeout must be finite and positive")
         deadline = time.monotonic() + budget
         chain_id, failures = uuid4().hex, []
         check = validator or self.validator
@@ -165,7 +171,10 @@ class FallbackLLM:
     async def astream(
         self, messages: Sequence[dict[str, Any]], *, timeout: float | None = None, **options: Any
     ) -> AsyncIterator[StreamChunk]:
-        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
+        budget = self.timeout if timeout is None else timeout
+        if not math.isfinite(budget) or budget <= 0:
+            raise ValueError("timeout must be finite and positive")
+        deadline = time.monotonic() + budget
         chain_id, failures = uuid4().hex, []
         for index, provider in enumerate(self.providers):
             remaining = deadline - time.monotonic()
@@ -177,7 +186,10 @@ class FallbackLLM:
             emitted = False
             with self._scope(chain_id, index, failures):
                 try:
-                    async with aclosing(provider.astream(messages, timeout=per_attempt, **options)) as stream:
+                    async with (
+                        asyncio.timeout(per_attempt),
+                        aclosing(provider.astream(messages, timeout=per_attempt, **options)) as stream,
+                    ):
                         async for chunk in stream:
                             if chunk.text or chunk.tool_calls or chunk.finish_reason or chunk.usage:
                                 emitted = True

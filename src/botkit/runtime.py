@@ -45,7 +45,8 @@ class ChatBot:
                 await adapter.send(
                     message.chat_id,
                     "Демонстрационный бот A1/A2/A4/A5. Отправьте текст или документ "
-                    "(PDF, DOCX, TXT, изображение; XLSX/PPTX с модулем office).",
+                    "(PDF, DOCX, TXT, изображение; XLSX/PPTX с модулем office). "
+                    "При настроенном ASR — также голосовое сообщение или MP3.",
                 )
 
             async def respond(message: IncomingMessage, adapter: MessengerAdapter = adapter) -> None:

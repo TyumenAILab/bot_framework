@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
@@ -19,52 +20,89 @@ from .parsing import parse_response
 
 
 class ProviderError(RuntimeError):
-    def __init__(self, message: str, *, status_code: int | None = None):
+    def __init__(self, message: str, *, status_code: int | None = None, reason: str = "unknown"):
         super().__init__(message)
         self.status_code = status_code
+        # Never expose provider text, URL, body or credentials as diagnostics.
+        self.reason = reason if reason in {
+            "unknown", "network_connect", "network_timeout", "network_other", "http_status",
+            "invalid_json", "invalid_response"
+        } else "unknown"
 
 
 def _usage(data: dict[str, Any]) -> dict[str, Any]:
-    usage = data.get("usage") or {}
-    known = all(
-        isinstance(usage.get(k), int) and usage[k] >= 0 for k in ("prompt_tokens", "completion_tokens")
-    )
+    # Optional accounting metadata must never turn valid generated text into a
+    # TypeError, or turn booleans/string counts into apparently measured usage.
+    usage = data.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+
+    def valid(value: Any) -> bool:
+        return type(value) is int and value >= 0
+
+    def count(value: Any) -> int:
+        return value if valid(value) else 0
+
+    prompt_details = usage.get("prompt_tokens_details")
+    output_details = usage.get("completion_tokens_details")
+    prompt_details = prompt_details if isinstance(prompt_details, dict) else {}
+    output_details = output_details if isinstance(output_details, dict) else {}
+    known = all(valid(usage.get(k)) for k in ("prompt_tokens", "completion_tokens"))
     return {
-        "input_tokens": max(0, usage.get("prompt_tokens") or 0),
-        "output_tokens": max(0, usage.get("completion_tokens") or 0),
-        "cached_tokens": max(0, (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
-        "reasoning_tokens": max(
-            0, (usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
-        ),
+        "input_tokens": count(usage.get("prompt_tokens")),
+        "output_tokens": count(usage.get("completion_tokens")),
+        "cached_tokens": count(prompt_details.get("cached_tokens")),
+        "reasoning_tokens": count(output_details.get("reasoning_tokens")),
         "usage_known": known,
     }
 
 
+def _tools(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ProviderError("Provider returned invalid tool calls", reason="invalid_response")
+    return value
+
+
+def _finish_reason(choice: dict[str, Any]) -> str | None:
+    value = choice.get("finish_reason")
+    if value is not None and not isinstance(value, str):
+        raise ProviderError("Provider returned an invalid finish reason", reason="invalid_response")
+    return value
+
+
 def _decode(data: dict[str, Any], config: LLMConfig) -> LLMResponse:
     if data.get("error"):
-        raise ProviderError("Provider returned an API error")
+        raise ProviderError("Provider returned an API error", reason="invalid_response")
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
-        raise ProviderError("Provider response has no choices")
+        raise ProviderError("Provider response has no choices", reason="invalid_response")
     choice = choices[0]
-    message = choice.get("message") or {}
+    if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+        raise ProviderError("Provider response has an invalid choice/message", reason="invalid_response")
+    message = choice["message"]
     content = message.get("content")
     if isinstance(content, list):
-        content = "".join(item.get("text", "") for item in content if item.get("type") == "text")
-    tools = message.get("tool_calls") or []
+        if any(not isinstance(item, dict) for item in content):
+            raise ProviderError("Provider response has invalid content blocks", reason="invalid_response")
+        text_parts = [item.get("text", "") for item in content if item.get("type") == "text"]
+        if any(not isinstance(part, str) for part in text_parts):
+            raise ProviderError("Provider response has invalid text blocks", reason="invalid_response")
+        content = "".join(text_parts)
+    tools = _tools(message.get("tool_calls"))
     if content is None and (tools or message.get("refusal")):
         content = message.get("refusal") or ""
     if not isinstance(content, str):
-        raise ProviderError("Provider response has no text or tool calls")
+        raise ProviderError("Provider response has no text or tool calls", reason="invalid_response")
     response, status = parse_response(content)
     return LLMResponse(
         response=response,
         raw=content,
         parse_status=status,
-        model=data.get("model") or config.model,
+        model=data.get("model") if isinstance(data.get("model"), str) else config.model,
         provider=config.provider,
-        request_id=data.get("id", ""),
-        finish_reason=choice.get("finish_reason"),
+        request_id=data.get("id") if isinstance(data.get("id"), str) else "",
+        finish_reason=_finish_reason(choice),
         tool_calls=tools,
         **_usage(data),
         meta={"usage": data.get("usage"), "system_fingerprint": data.get("system_fingerprint")},
@@ -110,6 +148,17 @@ class LLMGateway:
         if self._owns_client:
             await self.client.aclose()
 
+    def _timeout(self, value: float | None) -> float:
+        value = self.config.timeout if value is None else value
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError("timeout must be finite and positive")
+        return value
+
     def _payload(self, messages: Sequence[dict[str, Any]], options: dict[str, Any]) -> dict[str, Any]:
         # The original organizer uses max_tokens=None to omit the cap entirely.
         options = {key: value for key, value in options.items() if value is not None}
@@ -139,13 +188,19 @@ class LLMGateway:
                         self.config.base_url.rstrip("/") + "/" + path.lstrip("/"),
                         headers=self._headers,
                         timeout=self.config.timeout,
+                        follow_redirects=False,
                         **kwargs,
                     )
             except httpx.HTTPError as exc:
                 # Retrying an ambiguous POST could bill the user twice. Let the
                 # caller decide; never include exception URLs/headers in logs.
                 event.meta["network_error"] = type(exc).__name__
-                raise ProviderError(f"Provider network failure ({type(exc).__name__})") from None
+                reason = (
+                    "network_timeout" if isinstance(exc, httpx.TimeoutException)
+                    else "network_connect" if isinstance(exc, httpx.ConnectError)
+                    else "network_other"
+                )
+                raise ProviderError(f"Provider network failure ({type(exc).__name__})", reason=reason) from None
             event.http_status = response.status_code
             if response.status_code in {429, 503} and attempt < self.config.max_retries:
                 event.attempts += 1
@@ -156,13 +211,13 @@ class LLMGateway:
                 await asyncio.sleep(delay)
                 continue
             if not response.is_success:
-                raise ProviderError(f"Provider HTTP {response.status_code}", status_code=response.status_code)
+                raise ProviderError(f"Provider HTTP {response.status_code}", status_code=response.status_code, reason="http_status")
             try:
                 data = response.json()
-            except ValueError:
-                raise ProviderError("Provider returned invalid JSON") from None
+            except (ValueError, RecursionError):
+                raise ProviderError("Provider returned invalid JSON", reason="invalid_json") from None
             if not isinstance(data, dict):
-                raise ProviderError("Provider response must be a JSON object")
+                raise ProviderError("Provider response must be a JSON object", reason="invalid_response")
             return data
         raise AssertionError("Unreachable")
 
@@ -232,6 +287,7 @@ class LLMGateway:
         validator: Callable[[LLMResponse], None] | None = None,
         **options: Any,
     ) -> LLMResponse:
+        timeout = self._timeout(timeout)
         payload = self._payload(messages, options)
         payload["stream"] = False
         event = self._event("chat", messages)
@@ -239,7 +295,7 @@ class LLMGateway:
         event.meta["mode"] = self.config.mode
         start = time.perf_counter()
         try:
-            async with asyncio.timeout(self.config.timeout if timeout is None else timeout):
+            async with asyncio.timeout(timeout):
                 data = await self._completion(payload, event)
                 result = _decode(data, self.config)
             self._populate(event, result)
@@ -295,6 +351,7 @@ class LLMGateway:
             raise ValueError("Use A302_MODE=chat for streaming")
         if not self.config.supports_streaming:
             raise ValueError("Streaming is disabled for this provider")
+        timeout = self._timeout(timeout)
         payload = self._payload(messages, options)
         payload.update(stream=True)
         payload.setdefault("stream_options", {"include_usage": True})
@@ -303,7 +360,7 @@ class LLMGateway:
         parts: list[str] = []
         complete = False
         try:
-            async with asyncio.timeout(self.config.timeout if timeout is None else timeout):
+            async with asyncio.timeout(timeout):
                 async with (
                     request_slot(self.config.base_url, self.config.request_interval),
                     self.client.stream(
@@ -312,6 +369,7 @@ class LLMGateway:
                         headers=self._headers,
                         json=payload,
                         timeout=self.config.timeout,
+                        follow_redirects=False,
                     ) as response,
                 ):
                     event.http_status = response.status_code
@@ -326,24 +384,41 @@ class LLMGateway:
                         if value == "[DONE]":
                             complete = True
                             break
-                        data = json.loads(value)
+                        try:
+                            data = json.loads(value)
+                        except (ValueError, RecursionError):
+                            raise ProviderError("Provider stream returned invalid JSON") from None
+                        if not isinstance(data, dict):
+                            raise ProviderError("Provider stream returned an invalid response object")
                         if data.get("error"):
                             raise ProviderError("Provider stream returned an API error")
-                        event.provider_request_id = data.get("id") or event.provider_request_id
+                        if isinstance(data.get("id"), str):
+                            event.provider_request_id = data["id"] or event.provider_request_id
                         usage = data.get("usage")
                         if usage:
                             for name, count in _usage(data).items():
                                 setattr(event, name, count)
-                        choices = data.get("choices") or []
+                        choices = data.get("choices", [])
+                        if not isinstance(choices, list) or any(
+                            not isinstance(item, dict) for item in choices
+                        ):
+                            raise ProviderError("Provider stream returned invalid choices")
                         choice = choices[0] if choices else {}
-                        delta = choice.get("delta") or {}
-                        text = delta.get("content") or ""
+                        delta = choice.get("delta", {})
+                        if not isinstance(delta, dict):
+                            raise ProviderError("Provider stream returned an invalid delta")
+                        text = delta.get("content")
+                        text = "" if text is None else text
+                        if not isinstance(text, str):
+                            raise ProviderError("Provider stream returned non-text content")
+                        tools = _tools(delta.get("tool_calls"))
+                        finish_reason = _finish_reason(choice)
                         if text and event.first_token_ms is None:
                             event.first_token_ms = (time.perf_counter() - start) * 1000
                         parts.append(text)
-                        event.finish_reason = choice.get("finish_reason") or event.finish_reason
+                        event.finish_reason = finish_reason or event.finish_reason
                         yield StreamChunk(
-                            text, delta.get("tool_calls") or [], choice.get("finish_reason"), usage
+                            text, tools, finish_reason, usage if isinstance(usage, dict) else None
                         )
                     if not complete:
                         raise ProviderError("Provider stream ended before [DONE]")
@@ -362,12 +437,13 @@ class LLMGateway:
     async def aembed(
         self, texts: str | list[str], *, timeout: float | None = None, **options: Any
     ) -> list[list[float]]:
+        timeout = self._timeout(timeout)
         if "model" in options or "input" in options:
             raise ValueError("Configure the embedding model on a separate gateway")
         event = self._event("embeddings", texts)
         start = time.perf_counter()
         try:
-            async with asyncio.timeout(self.config.timeout if timeout is None else timeout):
+            async with asyncio.timeout(timeout):
                 data = await self._request(
                     "POST", "embeddings", event, json={"model": self.model_name, "input": texts, **options}
                 )
@@ -407,13 +483,14 @@ class LLMGateway:
         """
         if self.config.mode != "chat":
             raise ValueError("Transcription does not support 302.ai async polling")
+        timeout = self._timeout(timeout)
         event = self._event("transcription", {"mime_type": mime_type, "byte_count": len(data)})
         start = time.perf_counter()
         form = {"model": self.model_name, "response_format": "json"}
         if language is not None:
             form["language"] = language
         try:
-            async with asyncio.timeout(self.config.timeout if timeout is None else timeout):
+            async with asyncio.timeout(timeout):
                 body = await self._request(
                     "POST",
                     "audio/transcriptions",

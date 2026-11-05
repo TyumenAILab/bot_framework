@@ -4,7 +4,9 @@ import asyncio
 import json
 from html.parser import HTMLParser
 from io import BytesIO
-from zipfile import BadZipFile, ZipFile
+from zipfile import ZipFile
+
+from defusedxml.ElementTree import fromstring as safe_xml
 
 from .base import ExtractedContent
 from .config import ExtractionConfig, ExtractionError, ExtractionLimitError, UnsupportedContentError
@@ -31,12 +33,15 @@ def inspect_archive(data: bytes, config: ExtractionConfig) -> set[str]:
                     raise ExtractionError("Encrypted Office archives are not supported")
                 if "vbaproject" in info.filename.lower():
                     raise UnsupportedContentError("Macro-enabled documents are not supported")
-                if info.filename.endswith((".xml", ".rels")):
+                if info.filename.lower().endswith((".xml", ".rels")):
                     xml = archive.read(info)
-                    if b"<!DOCTYPE" in xml.upper() or b"<!ENTITY" in xml.upper():
-                        raise ExtractionError("XML entities are not allowed in Office documents")
+                    # The XML parser honours UTF-16/32 declarations too; a raw
+                    # byte substring check can miss DTD/entities in these encodings.
+                    safe_xml(xml, forbid_dtd=True, forbid_entities=True, forbid_external=True)
             return {i.filename for i in entries}
-    except BadZipFile:
+    except ExtractionError:
+        raise
+    except Exception:
         raise ExtractionError("Invalid Office archive") from None
 
 
@@ -90,6 +95,8 @@ class TextExtractor:
         try:
             text = data.decode(encoding)
         except UnicodeError:
+            if data.startswith((b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff", b"\xef\xbb\xbf")):
+                raise ExtractionError("Text does not match its declared byte-order encoding") from None
             try:
                 text, encoding = data.decode("cp1251"), "cp1251"
                 warnings.append("encoding_fallback_cp1251_verify")
@@ -134,15 +141,20 @@ class OfficeExtractor:
         return mime_type in {DOCX, XLSX, PPTX}
 
     def _docx(self, data: bytes) -> tuple[str, dict, list[str]]:
-        from docx import Document
-        from docx.table import Table
+        try:
+            from docx import Document
+            from docx.table import Table
+        except ImportError:
+            raise UnsupportedContentError(
+                "DOCX requires the python-docx dependency; reinstall botkit"
+            ) from None
 
         document = Document(BytesIO(data))
         blocks, tables = [], []
-        cells = 0
+        cells = text_chars = 0
 
         def walk(container, depth=0):
-            nonlocal cells
+            nonlocal cells, text_chars
             if depth > 12:
                 raise ExtractionLimitError("DOCX nesting limit exceeded")
             for item in container.iter_inner_content():
@@ -156,6 +168,9 @@ class OfficeExtractor:
                     tables.append({"rows": rows})
                     yield "\n".join("\t".join(row) for row in rows)
                 else:
+                    text_chars += len(item.text)
+                    if text_chars > self.config.max_text_chars:
+                        raise ExtractionLimitError("DOCX text exceeds character limit")
                     yield item.text
 
         blocks.extend(walk(document))
@@ -167,7 +182,7 @@ class OfficeExtractor:
         except ImportError:
             raise UnsupportedContentError('XLSX requires pip install "botkit[office]"') from None
         workbook = load_workbook(BytesIO(data), read_only=True, data_only=False, keep_links=False)
-        sheets, cells = [], 0
+        sheets, cells, text_chars = [], 0, 0
         try:
             if len(workbook.worksheets) > self.config.max_pages:
                 raise ExtractionLimitError("Workbook sheet limit exceeded")
@@ -179,7 +194,11 @@ class OfficeExtractor:
                     cells += len(row)
                     if cells > self.config.max_cells:
                         raise ExtractionLimitError("Workbook cell limit exceeded")
-                    rows.append(["" if value is None else str(value) for value in row])
+                    values = ["" if value is None else str(value) for value in row]
+                    text_chars += sum(map(len, values))
+                    if text_chars > self.config.max_text_chars:
+                        raise ExtractionLimitError("Workbook text exceeds character limit")
+                    rows.append(values)
                 sheets.append({"name": sheet.title, "rows": rows})
         finally:
             workbook.close()
@@ -197,10 +216,10 @@ class OfficeExtractor:
         presentation = Presentation(BytesIO(data))
         if len(presentation.slides) > self.config.max_pages:
             raise ExtractionLimitError("Presentation slide limit exceeded")
-        slides, cells = [], 0
+        slides, cells, text_chars = [], 0, 0
 
         def texts(shapes, depth=0):
-            nonlocal cells
+            nonlocal cells, text_chars
             if depth > 12:
                 raise ExtractionLimitError("Slide nesting limit exceeded")
             for shape in shapes:
@@ -211,8 +230,15 @@ class OfficeExtractor:
                         cells += len(row.cells)
                         if cells > self.config.max_cells:
                             raise ExtractionLimitError("Presentation cell limit exceeded")
-                        yield "\t".join(c.text for c in row.cells)
+                        value = "\t".join(c.text for c in row.cells)
+                        text_chars += len(value)
+                        if text_chars > self.config.max_text_chars:
+                            raise ExtractionLimitError("Presentation text exceeds character limit")
+                        yield value
                 elif shape.has_text_frame:
+                    text_chars += len(shape.text_frame.text)
+                    if text_chars > self.config.max_text_chars:
+                        raise ExtractionLimitError("Presentation text exceeds character limit")
                     yield shape.text_frame.text
 
         for index, slide in enumerate(presentation.slides, 1):

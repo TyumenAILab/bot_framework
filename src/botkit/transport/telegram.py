@@ -1,22 +1,46 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import aclosing
 from io import BytesIO
 from typing import Any
 
-from .base import Attachment, Button, CallbackQuery, IncomingMessage, split_text
+from .base import (
+    Attachment,
+    Button,
+    CallbackQuery,
+    IncomingMessage,
+    _validate_attachment_metadata,
+    split_text,
+)
 from .common import BaseAdapter
 
 
 class _LimitedBuffer(BytesIO):
     def __init__(self, limit: int):
+        _validate_attachment_metadata(None, limit)
         super().__init__()
         self.limit = limit
 
     def write(self, value: bytes) -> int:
-        if self.tell() + len(value) > self.limit:
+        if self.tell() + memoryview(value).nbytes > self.limit:
             raise ValueError("Attachment exceeds the configured size limit")
         return super().write(value)
+
+    def writelines(self, lines: Any) -> None:
+        # BytesIO.writelines uses its C-level writer, bypassing an overridden write.
+        for line in lines:
+            self.write(line)
+
+
+class TelegramAttachmentDownloadError(ValueError):
+    """Fixed diagnostic that does not expose Bot API URLs/tokens or SDK errors."""
+
+    def __init__(self, stage: str, reason: str, status_code: int | None = None):
+        self.stage, self.reason, self.status_code = stage, reason, status_code
+        super().__init__(
+            f"Telegram attachment download failed: stage={stage} reason={reason} status={status_code}"
+        )
 
 
 class TelegramAdapter(BaseAdapter):
@@ -125,27 +149,72 @@ class TelegramAdapter(BaseAdapter):
         )
 
     async def _download(self, file_id: str) -> bytes:
-        file = await self._request("get_file", file_id=file_id)
-        if file.file_size and file.file_size > self.max_attachment_bytes:
-            raise ValueError("Attachment exceeds the configured size limit")
-        if not file.file_path:
-            raise ValueError("Telegram did not return file_path")
-        with _LimitedBuffer(self.max_attachment_bytes) as buffer:
-            await self.native.download_file(file.file_path, destination=buffer)
-            return buffer.getvalue()
+        stage = "request"
+        status = None
+        try:
+            _validate_attachment_metadata(None, self.max_attachment_bytes)
+            file = await self._request("get_file", file_id=file_id)
+            stage = "metadata"
+            _validate_attachment_metadata(file.file_size, self.max_attachment_bytes)
+            if not isinstance(file.file_path, str) or not file.file_path:
+                raise TelegramAttachmentDownloadError(stage, "missing_path")
+            with _LimitedBuffer(self.max_attachment_bytes) as buffer:
+                stage = "read"
+                if self.native.session.api.is_local:
+                    # aiogram explicitly closes its local-file reader in finally.
+                    await self.native.download_file(file.file_path, destination=buffer)
+                else:
+                    # Bot.download_file does not close a remote async generator
+                    # when destination.write fails. Own its public session stream
+                    # so size errors/cancellation release the HTTP response now,
+                    # rather than waiting for generator garbage collection.
+                    stream = self.native.session.stream_content(
+                        url=self.native.session.api.file_url(self.native.token, file.file_path),
+                        timeout=30,
+                        chunk_size=min(65536, self.max_attachment_bytes + 1),
+                        raise_for_status=True,
+                    )
+                    async with aclosing(stream):
+                        async for chunk in stream:
+                            buffer.write(chunk)
+                return buffer.getvalue()
+        except TelegramAttachmentDownloadError:
+            raise
+        except Exception as exc:
+            candidate_status = getattr(exc, "status", None)
+            if type(candidate_status) is int and 100 <= candidate_status <= 599:
+                status = candidate_status
+            reason = "invalid_metadata" if stage == "metadata" else "transport_error"
+            if isinstance(exc, ValueError) and str(exc) == "Attachment exceeds the configured size limit":
+                reason = "size_limit"
+            safe_error = TelegramAttachmentDownloadError(stage, reason, status)
+        raise safe_error from None
 
     def normalize(self, message: Any) -> IncomingMessage:
         attachments = []
-        for kind in ("document", "photo", "audio", "voice", "video", "sticker"):
+        for kind in ("animation", "video_note", "document", "photo", "audio", "voice", "video", "sticker"):
             value = getattr(message, kind, None)
             if not value:
                 continue
+            if kind == "document" and getattr(message, "animation", None):
+                # Telegram repeats an animation as document for old clients.
+                continue
             if kind == "photo":
                 value = value[-1]
-            default_mime = {"photo": "image/jpeg", "voice": "audio/ogg", "sticker": "image/webp"}
+            default_mime = {
+                "photo": "image/jpeg",
+                "voice": "audio/ogg",
+                "sticker": "image/webp",
+                "animation": "video/mp4",
+                "video_note": "video/mp4",
+            }
             attachments.append(
                 Attachment(
-                    kind="audio" if kind == "voice" else kind,
+                    kind="audio"
+                    if kind == "voice"
+                    else "video"
+                    if kind in {"animation", "video_note"}
+                    else kind,
                     mime_type=getattr(value, "mime_type", None)
                     or default_mime.get(kind, "application/octet-stream"),
                     filename=getattr(value, "file_name", None),
@@ -169,17 +238,24 @@ class TelegramAdapter(BaseAdapter):
         )
 
     async def _receive(self, message: Any) -> None:
+        from aiogram.dispatcher.event.bases import SkipHandler
+
         text = message.text or ""
         first = text.split(maxsplit=1)[0] if text else ""
         if first.startswith("/") and "@" in first and self._username:
             if first.split("@", 1)[1].casefold() != self._username.casefold():
-                return
+                raise SkipHandler
         await self.dispatch(self.normalize(message))
+        # aiogram observers stop at the first successful handler. This adapter
+        # must not consume an update before later, user-registered SDK handlers.
+        raise SkipHandler
 
     async def _receive_callback(self, query: Any) -> None:
+        from aiogram.dispatcher.event.bases import SkipHandler
+
         # Inline-mode callbacks without a chat remain accessible through native dispatcher.
         if query.message is None:
-            return
+            raise SkipHandler
         await self.dispatch_callback(
             CallbackQuery(
                 platform=self.platform,
@@ -191,10 +267,11 @@ class TelegramAdapter(BaseAdapter):
                 raw=query,
             )
         )
+        raise SkipHandler
 
     async def run(self) -> None:
-        self._username = (await self._request("get_me")).username
         try:
+            self._username = (await self._request("get_me")).username
             await self.dispatcher.start_polling(
                 self.native, close_bot_session=False, tasks_concurrency_limit=64
             )
@@ -202,6 +279,8 @@ class TelegramAdapter(BaseAdapter):
             await self.aclose()
 
     async def aclose(self) -> None:
-        await super().aclose()
-        if self._owns_bot:
-            await self.native.session.close()
+        try:
+            await super().aclose()
+        finally:
+            if self._owns_bot:
+                await self.native.session.close()

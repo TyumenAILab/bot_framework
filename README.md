@@ -1,10 +1,18 @@
 # botkit — фреймворк для чат-ботов
 
 Фреймворк по документу [«Модули фреймворка — приоритет.md»](docs/Модули%20фреймворка%20—%20приоритет.md).
-Обновления B1–B5/C1 загружены из итогового репозитория (HEAD `9cc6f76`).
-Локально добавлены A1/A2/A4 и A5; доменная логика остаётся в конкретных ботах.
-Изменения подготовлены для review в отдельной ветке по запросу владельца.
-Статус проверок и открытые ограничения — в [PR validation](docs/PR%20validation.md).
+Базовые A1/A2/A4/A5 включены в `main` через PR #1 (23 сентября 2026).
+Текущее обновление подготовлено на базе `main` (`c61c957`, 29 сентября 2026),
+включая числовые оценки B3, и добавляет переиспользуемый Pneuma ASR → LLM pipeline.
+Доменная логика остаётся в конкретных ботах. Новые изменения публикуются
+в отдельной ветке для review, без автоматического слияния и production deploy.
+Последние доработки и ограничения — в [CHANGELOG](CHANGELOG.md).
+Исторический отчёт A1/A2/A4/A5 — в [PR validation](docs/PR%20validation.md).
+
+Локальное исправление от 27.10.2026 закрывает файловые/сетевые регрессии и четыре
+ранее незакрытые A4-проверки. Полный pytest: 793 passed; offline acceptance: passed.
+Изменения не опубликованы в Git автоматически. Ограничения памяти native-парсеров
+и HTTP-декомпрессора Telegram требуют контейнерных лимитов — см. CHANGELOG.
 
 Пакет называется `botkit`, устанавливается как обычная Python-библиотека
 (`pip install`) — см. «Установка» ниже.
@@ -15,11 +23,11 @@
 pyproject.toml    манифест пакета — имя, версия, зависимости
 
 src/botkit/
-├── llm/          A1  LLM Provider Gateway              — реализован локально
-├── usage/        A2  Usage & Cost Tracker               — реализован локально
+├── llm/          A1  LLM Provider Gateway + ASR pipeline — реализован
+├── usage/        A2  Usage & Cost Tracker               — реализован
 ├── rag/          A3  RAG Ingestion & Retrieval           — реализован (chroma_store.py + др.)
-├── transport/    A4  Messenger Transport Adapter        — реализован локально
-├── extraction/   A5  Content Extraction Layer            — реализован локально
+├── transport/    A4  Messenger Transport Adapter        — реализован, ограничения см. CHANGELOG
+├── extraction/   A5  Content Extraction Layer            — реализован
 ├── dialog_policy/ B1 Dialogue Policy Engine   (SC01+SC06) — реализован (engine.py, intent_router.py)
 ├── attempts/     B2  Attempt & Revision Store (SC07)      — реализован (sqlite_store.py, sessions.py)
 ├── rubric/       B3  Rubric & Taxonomy Store  (SC08)      — реализован (sqlite_store.py)
@@ -127,6 +135,7 @@ from botkit.dialog_policy.base import SupportPolicy
 - [Ручной тест перед merge: env, модели, Telegram/VK](docs/Acceptance%20smoke%20test.md)
 - [LLM, учёт и мессенджеры](docs/Platform%20A1%20A2%20A4.md)
 - [Извлечение документов, PDF и изображений](docs/Extraction%20A5.md)
+- [Голосовые и MP3 через Pneuma: адрес в env, API и проверка](docs/Pneuma%20ASR.md)
 - [Подключение существующих ботов](docs/Platform%20migration.md)
 - [Проверки A1/A2/A4 от 17 сентября](docs/Platform%20validation.md)
 - [Обновление и проверки A5 от 23 сентября](docs/Extraction%20validation.md)
@@ -143,6 +152,30 @@ python -m botkit export --db data/usage.sqlite3 --output data/export.jsonl
 вложений A5, не замена всех навыков исходных ботов. Для запуска нужны токены.
 Реальные тарифы задаются в `config/prices.json`; неизвестная цена — не ноль.
 Ключи старых ботов в репозиторий не копируются.
+
+Для распознавания голосовых Telegram/VK и MP3 включите `ASR_PROVIDER=pneuma`
+и задайте `PNEUMA_BASE_URL` в `.env` (остальные параметры — в `.env.example`).
+`python -m botkit run` автоматически подключает Pneuma к A5. Сами аудиофайлы
+отправляются в Pneuma, а не Qwen/302.ai; демонстрационный чат-бот затем передаёт
+полученный транскрипт чат-модели для ответа.
+
+Новый протокол из `audio_processing_client.py` включается через
+`PNEUMA_UPLOAD_PROTOCOL=chunked`: загрузка частями, сверка смещения после обрыва,
+возобновление через `PNEUMA_UPLOAD_STATE_DB`. Для доработки распознанного текста
+включите `ASR_POSTPROCESS_ENABLED=true` и настройте `LOCAL_HUB_*`/`VLLM_*`.
+Это отдельный локальный LLM-запрос без облачного fallback. Готовая цепочка
+`TranscriptionPipeline` и её компоненты экспортируются из `botkit.llm`;
+они не зависят от SocratiQ. [Настройки и примеры](docs/Pneuma%20ASR.md#новый-протокол-и-доработка-llm).
+
+Проверка одного аудиофайла (без LLM, если `ASR_POSTPROCESS_ENABLED=false`):
+
+```powershell
+uv run --no-sync python examples/transcribe_audio.py voice.mp3 --env .env --live
+```
+
+Pneuma проверен локальными тестами с имитацией HTTP. Живая проверка сервера
+пока не выполнялась по запросу владельца; команда выше предназначена для её
+последующего явного запуска.
 
 PR предназначен для review, не является подтверждением полной приёмки или
 разрешением на production deploy. Известные ограничения перечислены в `docs/PR validation.md`.
