@@ -34,6 +34,10 @@ office = ["openpyxl>=3.1,<4", "python-pptx>=1,<2"]
 huggingface = ["langchain-huggingface>=0.1", "sentence-transformers>=3.0"]
 infinity = ["langchain-community>=0.3"]
 progress = ["tqdm>=4.60"]
+# TTS: конвертация WAV/OGG → OGG/Opus для голосовых сообщений (botkit.tts.audio, Kokoro).
+audio = ["soundfile>=0.12,<1", "numpy>=1.26"]
+# TTS: Google Cloud Text-to-Speech через Application Default Credentials.
+google = ["google-auth[requests]>=2.40,<3"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -93,9 +93,21 @@ def _message_id(value: str, *, local_key: str, global_key: str) -> dict[str, int
     return {local_key if local else global_key: int(number)}
 
 
+VK_UPLOAD_ATTEMPTS = 3
+
+
+class VKUploadError(RuntimeError):
+    """An upload to VK failed. ``str()`` is safe to show/log: no file content or server reply."""
+
+    def __init__(self, detail: str):
+        super().__init__("Could not upload the file to VK: " + detail)
+        self.detail = detail
+
+
 class VKAdapter(BaseAdapter):
     platform = "vk"
     message_limit = 4096
+    upload_retry_delay = 1.0
 
     def __init__(
         self,
@@ -165,6 +177,45 @@ class VKAdapter(BaseAdapter):
     async def _type(self, chat_id: str) -> None:
         await self.call_api("messages.setActivity", peer_id=int(chat_id), type="typing")
 
+    async def _upload_voice(self, data: bytes, *, peer_id: int, filename: str) -> str:
+        """getMessagesUploadServer → POST the file → docs.save; returns the attachment string.
+
+        The upload server sometimes answers with an HTML 5xx page instead of JSON, which the
+        stock vkbottle uploader turns into a bare JSONDecodeError. Each attempt therefore asks
+        for a fresh upload server (a 5xx page is usually that node) and a persistent failure is
+        reported as :class:`VKUploadError` with a content-free ``detail``.
+        """
+        from vkbottle import VoiceMessageUploader
+
+        if not data or len(data) > self.max_attachment_bytes:
+            raise ValueError("Voice message must be nonempty and within the attachment size limit")
+        uploader = VoiceMessageUploader(self.api)
+        uploaded: dict[str, Any] | None = None
+        for attempt in range(1, VK_UPLOAD_ATTEMPTS + 1):
+            server = await uploader.get_server(peer_id=peer_id)
+            raw = await self.api.http_client.request_text(
+                server["upload_url"], method="POST", data={"file": uploader.get_bytes_io(data, name=filename)}
+            )
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                uploaded = parsed
+                break
+            if attempt == VK_UPLOAD_ATTEMPTS:
+                # Never log the reply body: it is VK's HTML, but keep the diagnostic content-free.
+                raise VKUploadError(f"upload server did not return JSON after {attempt} attempts ({len(data)} bytes)")
+            logger.info("VK upload server gave a non-JSON reply; retrying (%d/%d)", attempt, VK_UPLOAD_ATTEMPTS - 1)
+            await asyncio.sleep(self.upload_retry_delay)
+        if uploaded is None or "file" not in uploaded:
+            raise VKUploadError("upload server rejected the file")
+        saved = (await self.api.request("docs.save", {"title": filename, **uploaded}))["response"]
+        kind = saved["type"]
+        return uploader.generate_attachment_string(
+            kind, saved[kind]["owner_id"], saved[kind]["id"], saved[kind].get("access_key")
+        )
+
     async def send_attachment(
         self,
         chat_id: str,
@@ -177,6 +228,12 @@ class VKAdapter(BaseAdapter):
     ) -> str:
         from vkbottle import DocMessagesUploader, PhotoMessageUploader
 
+        if kind == "voice":
+            # Native VK voice message (audio_message): the playable bubble. Needs OGG/Opus data.
+            attachment = await self._operation(
+                "upload_voice", lambda: self._upload_voice(data, peer_id=int(chat_id), filename=filename)
+            )
+            return await self._send_one(chat_id, caption, attachment=attachment, **options)
         if kind == "photo":
             uploader = PhotoMessageUploader(self.api, attachment_name=filename)
         elif kind in {"document", "audio", "video"}:
