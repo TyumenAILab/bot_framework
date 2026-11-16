@@ -270,35 +270,12 @@ class PneumaTranscriber:
 
 
 def load_transcriber(*, tracker: UsageTracker | None = None, store=None) -> AudioTranscriptionProvider | None:
-    """Opt-in ASR; legacy upload and no LLM processing remain the defaults.
+    """Opt-in ASR chosen by ``ASR_PROVIDER`` (pneuma, moonshine, module:factory or disabled).
 
-    A supplied store implements UploadStore and is used only for chunked uploads.
-    Postprocessing has its own explicit local-model configuration, never the
-    primary chatbot's automatic fallback chain.
+    Kept here for compatibility; the provider registry lives in ``botkit.asr``.
+    Legacy upload and no LLM processing remain the defaults for Pneuma. A supplied
+    store implements UploadStore and is used only for chunked Pneuma uploads.
     """
-    provider = os.getenv("ASR_PROVIDER", "").strip().lower()
-    if provider in {"", "none", "disabled"}:
-        return None
-    if provider != "pneuma":
-        raise ValueError("ASR_PROVIDER must be pneuma or disabled")
-    from .pneuma_upload import ChunkedPneumaTranscriber, UploadConfig
-    from .transcript import TranscriptionPipeline, load_transcript_processor
-    from .upload_state import SQLiteUploadStore
+    from botkit.asr.factory import load_asr
 
-    protocol = os.getenv("PNEUMA_UPLOAD_PROTOCOL", "legacy").strip().lower()
-    if protocol not in {"legacy", "chunked"}:
-        raise ValueError("PNEUMA_UPLOAD_PROTOCOL must be legacy or chunked")
-    if protocol == "legacy" and store is not None:
-        raise ValueError("Resumable upload stores require PNEUMA_UPLOAD_PROTOCOL=chunked")
-    config = UploadConfig.from_env() if protocol == "chunked" else PneumaConfig.from_env()
-    enabled = _env_bool("ASR_POSTPROCESS_ENABLED", False)
-    processor = load_transcript_processor(tracker=tracker) if enabled else None
-    if protocol == "chunked":
-        if store is None and (path := os.getenv("PNEUMA_UPLOAD_STATE_DB", "").strip()):
-            store = SQLiteUploadStore(path)
-        transcriber = ChunkedPneumaTranscriber(config, tracker=tracker, store=store)
-    else:
-        transcriber = PneumaTranscriber(config, tracker=tracker)
-    if processor is not None:
-        return TranscriptionPipeline(transcriber, processor, owns_components=True)
-    return transcriber
+    return load_asr(tracker=tracker, store=store)

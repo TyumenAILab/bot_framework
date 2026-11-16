@@ -3,6 +3,34 @@
 Этот журнал относится к библиотеке `bot_framework`, а не к отдельным ботам.
 Даты разделяют новое обновление и изменения, уже находящиеся в основной ветке.
 
+## 2026-11-11 — модули `botkit.asr` и `botkit.tts`, голосовые сообщения в VK
+
+Перенос голосовой части бота SocratiQ во фреймворк в виде заменяемых провайдеров.
+Подробности и примеры — [Голос — ASR и TTS](docs/Голос%20—%20ASR%20и%20TTS.md).
+
+- `botkit.asr`: единый интерфейс — прежний `AudioTranscriptionProvider`, поэтому любой
+  провайдер сразу работает и в A5 `AudioExtractor`. Реестр `load_asr()` /
+  `register_asr()`; `ASR_PROVIDER=pneuma|moonshine|module:factory|disabled`.
+  Новый `MoonshineTranscriber` (очередь по `MOONSHINE_MAX_CONCURRENT`, `on_queued`).
+  `transcribe_attachment()` скачивает вложение и убирает префиксы `[time] Speaker N:`.
+  Постобработка LLM (`ASR_POSTPROCESS_ENABLED`) теперь применима к любому встроенному провайдеру.
+- `botkit.llm.load_transcriber()` сохранён и делегирует `botkit.asr.load_asr()`;
+  поведение для `pneuma` и `disabled` не изменилось. Сообщение об ошибке для неизвестного
+  провайдера теперь перечисляет доступные имена (по-прежнему содержит `ASR_PROVIDER`).
+- `botkit.tts`: интерфейс `SpeechSynthesizer` / `SynthesizedAudio`; провайдеры Yandex SpeechKit,
+  Google Cloud TTS, Kokoro; реестр `load_tts()` / `register_tts()`;
+  `TTS_PROVIDER=yandex|google|kokoro|module:factory|disabled`. Обёртка `CachedSynthesizer`:
+  общий таймаут, объединение одинаковых запросов, кеш только в RAM, событие A2
+  (`kind=speech`, `operation=tts`, без текста и звука, стоимость не оценивается).
+  `speak()` / `send_audio()` отправляют OGG/Opus как голосовое, MP3/WAV — как аудиофайл.
+- VK: `VKAdapter.send_attachment(kind="voice")` отправляет нативное голосовое (`audio_message`)
+  с повтором на новом сервере загрузки, если VK отвечает HTML вместо JSON; ошибка —
+  `VKUploadError` без содержимого ответа. Telegram `kind="voice"` уже поддерживался.
+- Новые необязательные зависимости: `botkit[audio]` (soundfile, numpy — конвертация в OGG/Opus),
+  `botkit[google]` (google-auth). Без них остальные модули работают.
+- Тесты: `tests/test_asr.py`, `tests/test_tts.py`, `tests/test_vk_voice.py` (HTTP и VK API
+  имитируются). Реальные серверы ASR/TTS и VK не вызывались.
+
 ## 2026-10-27 — локальное исправление файловых и сетевых границ
 
 - VK: безопасные HTTPS-перенаправления вложений с проверкой каждого адреса,

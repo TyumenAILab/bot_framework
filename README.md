@@ -27,6 +27,9 @@ src/botkit/
 ├── usage/        A2  Usage & Cost Tracker               — реализован
 ├── rag/          A3  RAG Ingestion & Retrieval           — реализован (chroma_store.py + др.)
 ├── transport/    A4  Messenger Transport Adapter        — реализован, ограничения см. CHANGELOG
+├── asr/          Голос → текст: интерфейс + провайдеры (Pneuma, Moonshine, свой) — реализован
+├── tts/          Текст → голос: интерфейс + провайдеры (Yandex, Google, Kokoro, свой) + отправка
+                  голосовых в VK/Telegram — реализован; вне нумерации A/B/C
 ├── extraction/   A5  Content Extraction Layer            — реализован
 ├── dialog_policy/ B1 Dialogue Policy Engine   (SC01+SC06) — реализован (engine.py, intent_router.py)
 ├── attempts/     B2  Attempt & Revision Store (SC07)      — реализован (sqlite_store.py, sessions.py)
@@ -80,6 +83,11 @@ from botkit.dialog_policy.base import SupportPolicy
 
 Копии документов, на которых основан каркас — чтобы спецификация физически
 лежала рядом с кодом, а не только в родительской папке портфеля:
+
+**Голос:**
+
+- [«Голос — ASR и TTS.md»](docs/Голос%20—%20ASR%20и%20TTS.md) — распознавание и озвучка:
+  интерфейсы, смена провайдера через `.env`, отправка голосовых в VK, свой провайдер.
 
 **Спецификация и происхождение контрактов:**
 
